@@ -168,18 +168,55 @@ node sendSocket.js <command> [arguments]
 **Purpose:** Docker container build instructions
 
 **Build Process:**
-1. Base image: Node.js 20+
-2. Copy package files and install dependencies
+1. Base image: Node.js 20+ (configurable via `BASE_IMAGE` build-arg so
+   balenalib variants can be substituted for balenaOS alignment)
+2. Copy package files and install dependencies (works on both apk/alpine
+   and apt-get/balenalib base images)
 3. Copy source code
 4. Build TypeScript (`npm run build`)
-5. Expose port 4200
+5. Expose port 4200 (HTTP) and 4201 (HTTPS)
 6. Set startup command
+7. Healthcheck is a TCP probe to port 4200
 
 **Usage:**
 ```bash
 docker build -t njspc .
 docker run -p 4200:4200 -v /dev/ttyUSB0:/dev/ttyUSB0 njspc
+
+# For a balenalib base image:
+docker build -t njspc --build-arg BASE_IMAGE=balenalib/raspberry-pi-base:latest .
 ```
+
+---
+
+### `balena.yml`
+**Purpose:** Single-service manifest for balenaCloud / open-balena fleets
+(see [`docs/balena.md`](./balena.md) for the deployment walkthrough).
+
+**Service Defined:**
+- **poolController:** njsPC running on Raspberry Pi
+  - Ports 4200 (HTTP) / 4201 (HTTPS) / 39500 (SmartThings) / 39501 (Hubitat)
+  - RS-485 device bindings for `/dev/ttyUSB0` and `/dev/ttyACM0`
+  - Named volumes for config, data, backups, logs, and custom bindings
+  - Healthcheck pings `GET /` every 60s
+  - Reads `POOL_RS485_PORT` env to point at the active adapter
+
+**Volumes (persist on device, survive OTA):**
+- `poolcontroller-config` - Editable `/app/config.json`
+- `poolcontroller-data` - State & equipment snapshots
+- `poolcontroller-backups` - Auto-backup archives
+- `poolcontroller-logs` - Application logs
+- `poolcontroller-bindings` - Custom integration bindings
+
+**Environment Variables (service defaults; per-device overrides via
+Device Variables in the balena dashboard):**
+- `POOL_RS485_PORT` - RS-485 device node inside the container
+- `POOL_NET_CONNECT` - Use TCP bridge instead of direct serial
+- `POOL_NET_HOST` / `POOL_NET_PORT` - TCP bridge target
+- `TZ` - Site timezone
+- `NODE_ENV` - Always `production`
+- `POOL_LATITUDE` / `POOL_LONGITUDE` - Set per-device to suppress
+  heliotrope warnings
 
 ---
 

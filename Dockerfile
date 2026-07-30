@@ -1,13 +1,29 @@
 ### Build stage
-FROM node:20-alpine AS build
+# Balena fleets can substitute the base image via --build-arg BASE_IMAGE when
+# they need a balenalib variant (e.g. balenalib/raspberry-pi-base:latest) for
+# tighter OS-level alignment with balenaOS. Default stays upstream node:20-alpine
+# because balenalib variants are slow to release and serialport ships prebuilt
+# binaries for node-20 linux-arm glibc/alpine.
+ARG BASE_IMAGE=node:20-alpine
+FROM ${BASE_IMAGE} AS build
 LABEL maintainer="nodejs-poolController"
 LABEL org.opencontainers.image.title="nodejs-poolController"
 LABEL org.opencontainers.image.description="Bridge Pentair / compatible pool automation equipment to modern interfaces (REST, WebSockets, MQTT, Influx, Rules)."
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
-LABEL org.opencontainers.image.source="https://github.com/tagyoureit/nodejs-poolController"
+LABEL org.opencontainers.image.source="https://github.com/ultron-aquabutler/poolController"
+LABEL org.opencontainers.image.upstream_source="https://github.com/tagyoureit/nodejs-poolController"
+LABEL io.balena.app-name="poolcontroller"
 
 # Install build toolchain only for native deps (serialport, etc.)
-RUN apk add --no-cache make gcc g++ python3 linux-headers udev tzdata git
+# On alpine we use apk; on debian/ubuntu balenalib images we'd swap to apt-get.
+# The conditional keeps the Dockerfile portable.
+RUN if command -v apk >/dev/null 2>&1; then \
+        apk add --no-cache make gcc g++ python3 linux-headers udev tzdata git; \
+    elif command -v apt-get >/dev/null 2>&1; then \
+        apt-get update && apt-get install -y --no-install-recommends \
+            build-essential python3 python3-dev libudev-dev tzdata git ca-certificates \
+            && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 WORKDIR /app
 
@@ -28,11 +44,14 @@ RUN npm run build
 RUN npm prune --production
 
 ### Runtime stage
-FROM node:20-alpine AS prod
+ARG BASE_IMAGE=node:20-alpine
+FROM ${BASE_IMAGE} AS prod
 LABEL org.opencontainers.image.title="nodejs-poolController"
 LABEL org.opencontainers.image.description="Bridge Pentair / compatible pool automation equipment to modern interfaces (REST, WebSockets, MQTT, Influx, Rules)."
+LABEL org.opencontainers.image.source="https://github.com/ultron-aquabutler/poolController"
+LABEL org.opencontainers.image.upstream_source="https://github.com/tagyoureit/nodejs-poolController"
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
-LABEL org.opencontainers.image.source="https://github.com/tagyoureit/nodejs-poolController"
+LABEL io.balena.app-name="poolcontroller"
 ENV NODE_ENV=production
 
 # Use existing 'node' user from base image; just ensure work directory exists
