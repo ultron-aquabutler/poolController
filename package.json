@@ -20,7 +20,11 @@
         "start": "npm run build && node dist/app.js",
         "start:cached": "node dist/app.js",
         "build": "tsc",
-        "watch": "tsc -w"
+        "watch": "tsc -w",
+        "start:simulate": "npm run build && node dist/app.js --simulate",
+        "test": "node --test --require ./tests/ts-node-register.js tests/simulator/*.test.ts",
+        "test:simulator": "node --test --require ./tests/ts-node-register.js tests/simulator/*.test.ts",
+        "test:simulate": "node --test --test-concurrency=1 --require ./tests/ts-node-register.js tests/simulator/*.test.ts"
     },
     "dependencies": {
         "@influxdata/influxdb-client": "^1.35.0",
