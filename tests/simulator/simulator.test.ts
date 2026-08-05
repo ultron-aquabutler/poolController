@@ -34,6 +34,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  * A single shared simulator is used across all subtests — the harness
  * stops individual resources between tests via `stop()` and the
  * process is torn down once at the end via `fullTeardown()`.
+ *
+ * The final `test.after` hook invokes `fullTeardown()` so the runner
+ * exits cleanly. Without it, njsPC's AquaLinkBoard keeps a setInterval
+ * alive (heliotrope recalculation every ~18s) and `npm test` hangs
+ * even after all subtests pass.
  */
 
 import * as nodeTest from 'node:test';
@@ -42,6 +47,7 @@ import * as nodeAssert from 'node:assert/strict';
 import {
     SimulatorHarness,
     SimulatorHandle,
+    fullTeardown,
     installExitHook,
 } from '../../controller/simulator/SimulatorHarness';
 import { PanelSimulator } from '../../controller/simulator/PanelSimulator';
@@ -201,4 +207,10 @@ test('simulator harness: PanelSimulator returns date/time on GET 197', async (t)
     // Index 7 = action. Index 8 = datalen. Index 9..15 = payload.
     assert.equal(r[7], 5, 'response action is 5 (date/time)');
     assert.equal(r[8], 7, 'date/time payload is 7 bytes');
+});
+
+// Suite-level teardown: stop njsPC app + close simulator so `npm test` exits 0.
+// fullTeardown() internally calls app.stopAsync() which ends with process.exit().
+test.after(async () => {
+    await fullTeardown();
 });
