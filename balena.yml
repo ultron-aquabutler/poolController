@@ -1,0 +1,114 @@
+# balena.yml — fleet / application manifest for nodejs-poolController (njsPC)
+# Loaded by `balena push <fleet>` or by open-balena on self-hosted fleets.
+# Reference: https://docs.balena.io/reference/balena.yml/
+
+# The balena base image used for the build stage. Must match the target fleet's
+# architecture. balenalib images are produced for every supported device type
+# and include the native build toolchain (gcc, python, linux-headers) needed
+# to compile the `serialport` native binding.
+buildkit:
+  # Compose-style network so the GHCR base image can be pulled during build.
+  network: host
+
+# Images built by `balena build` are tagged into this image registry path.
+# Bryan normally pushes to ghcr.io/ultron-aquabutler — balena ignores this if
+# pushing into the balena/balena-cloud registry instead.
+images:
+  application: ghcr.io/ultron-aquabutler/njspc
+  # Optional: pin a fleet-specific tag here when open-balena is in use.
+
+# Single-service application. njsPC owns the RS-485 bus and serves its UI.
+services:
+  poolController:
+    # Build context = repo root; use the existing multi-stage Dockerfile.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Build-args surfaced so balena OS / arch specific tweaks can happen
+      # without forking the Dockerfile per device.
+      args:
+        - NODE_VERSION=20
+    # Public hostname balena assigns in the device dashboard / local DNS.
+    hostname: poolcontroller
+    # Run as the unprivileged `node` user (matches Dockerfile USER node).
+    user: node
+    # Keep running across crashes; supervisor restarts on exit.
+    restart: always
+    # Expose UI + REST + Socket.IO + optional HTTPS on the device's LAN.
+    ports:
+      - "4200:4200/tcp"   # web UI (defaultConfig.web.servers.http.port)
+      - "4201:4201/tcp"   # HTTPS (only used if config enables it)
+      - "39500:39500/tcp" # SmartThings REST interface (optional, default in config)
+      - "39501:39501/tcp" # Hubitat REST interface (optional, default in config)
+      - "3480:3480/tcp"   # Vera / UPnP discovery (optional)
+    # Persistent data on the device's balena-supervisor volume, not the host fs.
+    volumes:
+      - "poolcontroller-data:/app/data"
+      - "poolcontroller-backups:/app/backups"
+      - "poolcontroller-logs:/app/logs"
+      - "poolcontroller-bindings:/app/web/bindings/custom"
+      # config.json is editable from the host via balena's file browser; bind
+      # a named volume so changes survive `balena push` OTA updates.
+      - "poolcontroller-config:/app/config.json:rw"
+    # Hardware devices: RS-485 USB-to-serial adapter. The kernel node on
+    # balenaOS is /dev/ttyUSB0 (FTDI / CH340 / CP2102) for typical adapters;
+    # some RS-485 shields enumerate as /dev/ttyACM0. Override per device with
+    # the BALENA_RS485_DEVICE device-variable if your hardware differs.
+    devices:
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+      - "/dev/ttyACM0:/dev/ttyACM0"
+    # Service-level environment variables. Bryan can override per device in
+    # the balena dashboard → Device Variables. Defaults below assume a
+    # stand-alone pool controller with a USB RS-485 adapter.
+    environment:
+      # Tell njsPC which device node holds the RS-485 adapter. Config.ts
+      # reads POOL_RS485_PORT and patches controller.comms.rs485Port.
+      - "POOL_RS485_PORT=/dev/ttyUSB0"
+      # We are NOT using a ScreenLogic network bridge — direct serial only.
+      - "POOL_NET_CONNECT=false"
+      # Default to local config; balena device variables can override.
+      - "POOL_NET_HOST=raspberrypi"
+      - "POOL_NET_PORT=9801"
+      # Geolocation is site-specific; left blank here on purpose.
+      # Set POOL_LATITUDE / POOL_LONGITUDE in the device dashboard.
+      - "TZ=America/Phoenix"
+      - "NODE_ENV=production"
+    # Balena supervisor pings this URL on the device for liveness. njsPC's
+    # Express server answers GET / with the dashboard HTML; if HTTPS is
+    # enabled and redirects, fall back to a TCP-only path or /config which
+    # always returns JSON. See docs/balena.md for tuning notes.
+    healthcheck:
+      interval: 60s
+      timeout: 8s
+      start_period: 90s
+      retries: 4
+      path: /
+      port: 4200
+    # Image labels — balena uses these in the fleet dashboard.
+    labels:
+      - "io.balena.qemu.version=8.0.0-rc8+qemu-7.2"
+      - "io.balena.features.supervisor-api=1.2.0"
+      - "io.balena.features.balena-api=1.2.0"
+      - "io.balena.features.device-plugin=1.2.0"
+      - "org.opencontainers.image.title=nodejs-poolController"
+      - "org.opencontainers.image.description=Bridge Pentair / compatible pool automation equipment to REST, WebSockets, MQTT, Influx, Rules. Balena fleet build for Raspberry Pi."
+      - "org.opencontainers.image.source=https://github.com/ultron-aquabutler/poolController"
+      - "org.opencontainers.image.licenses=AGPL-3.0-only"
+
+# Named volumes map onto the device's persistent storage managed by
+# balena-supervisor. They survive OTA updates and host reboots.
+volumes:
+  poolcontroller-data:
+  poolcontroller-backups:
+  poolcontroller-logs:
+  poolcontroller-bindings:
+  poolcontroller-config:
+
+# Override device-types Bryan cares about. balena's default fleet type is
+# raspberry-pi; the build will produce a manifest that works on every Pi
+# family supported by balenaOS (Pi 3, 4, Zero 2 W, 5). If a future fleet
+# needs Jetson Nano or amd64 gateway boxes, add deviceTypes below.
+# deviceTypes:
+#   - raspberrypi4-64
+#   - raspberrypi3
+#   - raspberrypizero2w-64

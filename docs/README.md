@@ -106,6 +106,8 @@ Testing infrastructure for simulating pool equipment without hardware.
 | `defaultConfig.json` | Default configuration template |
 | `Dockerfile` | Container build instructions |
 | `docker-compose.yml` | Multi-container orchestration |
+| `balena.yml` | Balena fleet / open-balena service manifest |
+| [`docs/balena.md`](./balena.md) | Balena deployment guide (Raspberry Pi) |
 
 ## Data Persistence
 

@@ -273,6 +273,12 @@ All three parameters are safe to adjust without restarting; edits to `config.jso
  * `mdns` - Not currently used.
  * `ssdp` - Enable for automatic configuration by the webClient and other platforms.
 
+ ## Deployment
+
+ * `docker-compose.yml` - desktop / local Linux deployment.
+ * `balena.yml` + [`docs/balena.md`](./docs/balena.md) - balenaCloud /
+   open-balena fleet deployment on Raspberry Pi.
+
 
 ## Log - Different aspects of logging to the application
  * `app` - Application wide settings
