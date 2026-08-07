@@ -29,10 +29,112 @@ import { webApp, REMInterfaceServer } from "./web/Server";
 import * as readline from 'readline';
 import { sl } from './controller/comms/ScreenLogic'
 
+/**
+ * Parse simple --key / --key=value CLI flags from process.argv.
+ * Recognised flags:
+ *   --simulate                 Force every RS-485 comms port into mock mode and
+ *                              use the in-process PanelSimulator. No real
+ *                              serial hardware required. Designed for dev/CI.
+ *   --simulate-port=<portId>   Only flip the named port into mock mode (can
+ *                              be repeated). Defaults to portId 0.
+ *   --simulate-config=<path>   Load initial panel state from a JSON file
+ *                              instead of the default EasyTouch layout.
+ *   --help                     Print recognised flags and exit.
+ */
+export function parseCliFlags(argv: string[]): {
+    simulate: boolean;
+    simulatePorts: number[];
+    simulateConfigPath?: string;
+    showHelp: boolean;
+} {
+    const result = {
+        simulate: false,
+        simulatePorts: [] as number[],
+        simulateConfigPath: undefined as string | undefined,
+        showHelp: false,
+    };
+    for (const arg of argv) {
+        if (arg === '--simulate') {
+            result.simulate = true;
+            continue;
+        }
+        if (arg === '--help' || arg === '-h') {
+            result.showHelp = true;
+            continue;
+        }
+        if (arg.startsWith('--simulate-port=')) {
+            const v = parseInt(arg.split('=')[1], 10);
+            if (!isNaN(v)) result.simulatePorts.push(v);
+            continue;
+        }
+        if (arg.startsWith('--simulate-config=')) {
+            result.simulateConfigPath = arg.split('=')[1];
+            continue;
+        }
+    }
+    return result;
+}
+
+export function printHelp(): void {
+    /* eslint-disable no-console */
+    console.log(`nodejs-poolController — simulate mode flags`);
+    console.log(`  --simulate                  Boot against the in-process PanelSimulator.`);
+    console.log(`                              No real serial hardware required.`);
+    console.log(`  --simulate-port=<portId>    Only flip a specific comms port to mock.`);
+    console.log(`  --simulate-config=<path>    Load initial panel state from JSON.`);
+    console.log(`  --help / -h                 Show this help.`);
+    /* eslint-enable no-console */
+}
+
+/**
+ * Apply CLI flags to the loaded config. Must be called AFTER config.init()
+ * but BEFORE any RS-485 ports are opened.
+ */
+export function applyCliFlags(flags: ReturnType<typeof parseCliFlags>): void {
+    if (flags.showHelp) {
+        printHelp();
+    }
+    if (!flags.simulate && flags.simulatePorts.length === 0) return;
+    const ctrl = config.getSection('controller') as any;
+    const sections: string[] = [];
+    for (const k of Object.keys(ctrl)) {
+        if (k.startsWith('comms')) sections.push(k);
+    }
+    if (sections.length === 0) sections.push('comms');
+
+    for (const sec of sections) {
+        const p = ctrl[sec];
+        const isTargeted = flags.simulate ||
+            flags.simulatePorts.includes(p?.portId ?? 0);
+        if (!isTargeted) continue;
+        p.type = 'mock';
+        p.mock = true;
+        p.enabled = true;
+        p.rs485Port = 'MOCK_PORT';
+        p.inactivityRetry = 0;
+        config.setSection(`controller.${sec}`, p);
+    }
+}
+
 export async function initAsync() {
     try {
         await config.init();
         await logger.init();
+        const flags = parseCliFlags(process.argv.slice(2));
+        if (process.env.POOL_SIMULATE === '1' || process.env.POOL_SIMULATE === 'true') flags.simulate = true;
+        applyCliFlags(flags);
+        if (flags.simulateConfigPath) {
+            try {
+                const fs = require('fs');
+                const json = JSON.parse(
+                    fs.readFileSync(flags.simulateConfigPath, 'utf8'));
+                config.setSection('simulator', { initialState: json });
+            } catch (err) {
+                (logger as any)?.error?.(
+                    `Could not load --simulate-config: ${err.message}`) ??
+                    console.error(`Could not load --simulate-config: ${err.message}`);
+            }
+        }
         await sys.init();
         await state.init();
         await webApp.init();

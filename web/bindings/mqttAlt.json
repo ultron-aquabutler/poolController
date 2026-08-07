@@ -33,7 +33,7 @@
                 }
             ],
             "rootTopic-DIRECTIONS": "You can override the root topic by renaming _rootTopic to rootTopic",
-            "_rootTopic": "@bind=(state.equipment.alias).replace(' ','-').replace('/','').toLowerCase();",
+            "rootTopic": "aquabutlers/pool/@bind=process.env.POOL_DEVICE_ID || state.equipment.model.replace(/ /g,'-').replace('/','').toLowerCase();",
             "clientId": "@bind='mqttjs_njsPC_'+Math.random().toString(16).substr(2, 8);"
         }
     },

@@ -19,7 +19,12 @@
         "web/**/*",
         "logger/**/*",
         "controller/**/*",
-        "config/**/*", 
+        "config/**/*",
+        "tests/**/*",
         "**/*.ts"
+    ],
+    "exclude": [
+        "node_modules",
+        "dist"
     ]
 }

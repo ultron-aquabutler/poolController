@@ -169,7 +169,7 @@
           "username": "",
           "password": "",
           "selfSignedCertificate": false,
-          "rootTopic": "@bind=(state.equipment.model).replace(/ /g,'-').replace('/','').toLowerCase();",
+          "rootTopic": "aquabutlers/pool/@bind=process.env.POOL_DEVICE_ID || state.equipment.alias.replace(/ /g,'-').replace('/','').toLowerCase();",
           "retain": true,
           "qos": 0,
           "changesOnly": true
@@ -209,7 +209,7 @@
           "port": 1883,
           "username": "",
           "password": "",
-          "rootTopic": "@bind=(state.equipment.model).replace(/ /,'-').replace('/','').toLowerCase();Alt",
+          "rootTopic": "aquabutlers/pool/@bind=process.env.POOL_DEVICE_ID || state.equipment.alias.replace(/ /g,'-').replace('/','').toLowerCase();Alt",
           "retain": true,
           "qos": 0,
           "changesOnly": true
