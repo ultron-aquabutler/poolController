@@ -18,6 +18,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 import { EventEmitter } from 'events';
 import { logger } from "../logger/Logger";
 import * as util from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
 class HeliotropeContext {
     constructor(longitude: number, latitude: number, zenith: number) {
         this._zenith = typeof zenith !== 'undefined' ? zenith : 90 + 50 / 60;
@@ -136,6 +138,7 @@ export class Heliotrope {
             this.dt.getMonth() !== dt.getMonth() ||
             this.dt.getDate() !== dt.getDate()) {
             this.isCalculated = false;
+            this._warningSuppressed = false;
             // Always store a copy since we don't want to create instances where the change doesn't get reflected.  This
             // also could hold onto references that we don't want held for garbage cleanup.
             this.dt = typeof dt !== 'undefined' && typeof dt.getMonth === 'function' ? new Date(dt.getFullYear(), dt.getMonth(), dt.getDate(),
@@ -146,6 +149,7 @@ export class Heliotrope {
     public set longitude(lon: number) {
         if (this._longitude !== lon) {
             this.isCalculated = false;
+            this._warningSuppressed = false;
         }
         this._longitude = lon;
     }
@@ -153,12 +157,16 @@ export class Heliotrope {
     public set latitude(lat: number) {
         if (this._latitude !== lat) {
             this.isCalculated = false;
+            this._warningSuppressed = false;
         }
         this._latitude = lat;
     }
     public get zenith() { return this._zenith; }
     public set zenith(zen: number) {
-        if (this._zenith !== zen) this.isCalculated = false;
+        if (this._zenith !== zen) {
+            this.isCalculated = false;
+            this._warningSuppressed = false;
+        }
         this._zenith = zen;
     }
     private dt: Date;
@@ -171,6 +179,7 @@ export class Heliotrope {
     private _dtNextSunset: Date;
     private _dtPrevSunrise: Date;
     private _dtPrevSunset: Date;
+    private _warningSuppressed: boolean = false;
     public get isNight(): boolean {
         let times = this.calculatedTimes;
         if (this.isValid) {
@@ -213,8 +222,12 @@ export class Heliotrope {
             this.isCalculated = true;
             logger.verbose(`Calculated Heliotrope: sunrise:${Timestamp.toISOLocal(this._dtSunrise)} sunset:${Timestamp.toISOLocal(this._dtSunset)}`);
         }
-        else 
-            logger.warn(`dt:${this.dt} lat:${this._latitude} lon:${this._longitude} Not enough information to calculate Heliotrope.  See https://github.com/tagyoureit/nodejs-poolController/issues/245`);
+        else {
+            if (!this._warningSuppressed) {
+                logger.warn(`dt:${this.dt} lat:${this._latitude} lon:${this._longitude} Not enough information to calculate Heliotrope.  See https://github.com/tagyoureit/nodejs-poolController/issues/245`);
+                this._warningSuppressed = true;
+            }
+        }
     }
     public get sunrise(): Date {
         if (!this.isCalculated) this.calcInternal();
@@ -242,9 +255,11 @@ export class Heliotrope {
     }
     public get calculatedTimes(): { sunrise?: Date, sunset?: Date, nextSunrise?: Date, nextSunset?: Date, prevSunrise?: Date, prevSunset: Date, isValid: boolean } { return { sunrise: this.sunrise, sunset: this.sunset, nextSunrise: this.nextSunrise, nextSunset: this.nextSunset, prevSunrise: this.prevSunrise, prevSunset: this.prevSunset, isValid: this.isValid }; }
     public calcAdjustedTimes(dt: Date, hours = 0, min = 0): { sunrise?: Date, sunset?: Date, nextSunrise?: Date, nextSunset?: Date, prevSunrise?: Date, prevSunset: Date, isValid: boolean } {
+        if (!this.isValid) return { sunrise: undefined, sunset: undefined, nextSunrise: undefined, nextSunset: undefined, prevSunrise: undefined, prevSunset: undefined, isValid: false };
         if (this.dt.getFullYear() === dt.getFullYear() && this.dt.getMonth() === dt.getMonth() && this.dt.getDate() === dt.getDate()) return this.getAdjustedTimes(hours, min);
         let ms = (hours * 3600000) + (min * 60000);
         let times = this.calculate(dt);
+        if (!times.isValid) return { sunrise: undefined, sunset: undefined, nextSunrise: undefined, nextSunset: undefined, prevSunrise: undefined, prevSunset: undefined, isValid: false };
         return {
             sunrise: new Date(times.sunrise.getTime() + ms),
             sunset: new Date(times.sunset.getTime() + ms),
@@ -252,7 +267,7 @@ export class Heliotrope {
             nextSunset: new Date(times.nextSunset.getTime() + ms),
             prevSunrise: new Date(times.prevSunrise.getTime() + ms),
             prevSunset: new Date(times.prevSunset.getTime() + ms),
-            isValid: this.isValid
+            isValid: true
         } 
     }
     public getAdjustedTimes(hours = 0, min = 0): { sunrise?: Date, sunset?: Date, nextSunrise?: Date, nextSunset?: Date, prevSunrise?: Date, prevSunset: Date, isValid: boolean } {
@@ -800,6 +815,37 @@ export class Utils {
     }
     public dec2bin(dec) {
         return (dec >>> 0).toString(2).padStart(8, '0');
+    }
+    /**
+     * Write a file so that a crash or power loss mid-write leaves either the
+     * previous contents or the new ones, never a truncated file.
+     *
+     * fs.writeFileSync truncates the target before writing, so an interruption
+     * between the two leaves it empty or partial. Writing a temporary file in the
+     * same directory, flushing it, and renaming it over the target avoids that:
+     * rename is atomic on POSIX filesystems and replaces the target in place on
+     * Windows.
+     *
+     * Do not use this for a file watched with fs.watch on its own path. The
+     * rename replaces the inode, and on Linux such a watch stops firing
+     * afterwards.
+     */
+    public writeFileAtomicSync(filePath: string, data: string) {
+        const tmpPath = `${filePath}.tmp`;
+        const fd = fs.openSync(tmpPath, 'w');
+        try {
+            fs.writeFileSync(fd, data);
+            fs.fsyncSync(fd);
+        }
+        finally { fs.closeSync(fd); }
+        fs.renameSync(tmpPath, filePath);
+        // Make the rename itself durable. Directories cannot be opened this way
+        // on every platform; the rename is still atomic without it.
+        try {
+            const dirFd = fs.openSync(path.dirname(filePath), 'r');
+            try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+        }
+        catch (err) { }
     }
 }
 

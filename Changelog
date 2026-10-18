@@ -1,5 +1,197 @@
 # Changelog
 
+## 10.0.2
+
+### New Features
+1. **IntelliChlor Plus/LT models** — add IntelliChlor Plus and LT series chlorinator models and log unknown models for identification (#1229).
+2. **Nixie solar/UltraTemp cool setpoint** — add `hasCoolSetpoint` to solar and UltraTemp heat modes so the cool setpoint is exposed (#1249).
+
+### Bug Fixes
+3. **Heater preferred heat sources** — guard preferred heat source picklist behind combustion check to prevent missing heat sources on systems without gas heaters (#1199).
+4. **Stale schedule `isOn` flags** — clear stale schedule `isOn` flags when a schedule end is not pushed by the controller (#1199).
+5. **Heater cooldown delay** — correct cooldown delay calculation and time method (#1238).
+6. **Repeated body temperature warnings** — suppress repeated "no temperature" body warnings, and keep them suppressed across heater passes (#1239, #1241).
+7. **ScreenLogic config preserved on RS-485 writes** — saving RS-485 port settings no longer clobbers ScreenLogic configuration (#1237).
+8. **Atomic config/state persistence** — write `poolConfig.json` and `poolState.json` atomically to prevent corruption on crash or power loss (#1240).
+9. **IntelliCenter WS setpoint gap** — couple heat/cool setpoints on body setpoint writes to maintain the controller's minimum gap (#1199).
+10. **Shutdown handling** — deduplicate shutdown logic and handle `SIGTERM` for clean exits (e.g., Docker/systemd) (#1247).
+11. **StateSocket circuit state** — correct circuit state boolean evaluation logic.
+
+### CI
+12. **GHCR publish** — bump GitHub Actions versions and add ephemeral warn flag.
+
+## 10.0.1
+
+### New Features
+1. **Versaflo check error code** — added 0xF3 fault code for "Check Versaflo" heater status (#1215).
+2. **JXi/LXi gas valve hours & cycle count** — expose lifetime gas valve hours and ignition cycle count from 0x25 response (#1128).
+3. **JXi/LXi feedBodyTemp option** — allow JXi/LXi heaters to report body temperature from their own sensor (#1128).
+
+### Bug Fixes
+4. **IntelliCenter schedule/heater/circuit param handling** — correct WS parameter names for schedule heat source, day mask, and delete operations (#1199).
+5. **Heater WS address mapping** — correct heater address assignment over WebSocket and sync chlorinator output percentage via WS (#1199).
+6. **Schedule day bitmask & timezone** — fix day-of-week bitmask mapping and date timezone handling for schedules (#1199).
+7. **Heatpump source values** — correct heatpump source enum values, add deleteCircuit support, and refresh schedule heat sources on heater config change (#1199).
+8. **v3.x i5P personality detection** — add support for IntelliCenter v3.x i5P personality byte [3,1] (#1223).
+9. **ScreenLogic hardcoded password** — remove hardcoded password and fix port condition for ScreenLogic connections (#1220).
+10. **Versaflo case position** — move 'Check Versaflo' case to correct enum position in HeaterStateMessage (#1215).
+11. **JXi/LXi 0x25 byte layout** — correct response byte layout and add additional fault codes; swap GV hours and cycle count byte positions (#1215).
+12. **Heat source comparison & solar collector** — correct heat source comparison logic and solar collector temperature threshold handling (#1212).
+13. **WS schedule heat source/day/delete** — fix WebSocket schedule heat source assignment, day mask encoding, and schedule delete handling (#1199).
+14. **JXi/LXi temp polling** — send explicit 0x25 temperature query on each JXi/LXi poll cycle (#1128).
+15. **JXi/LXi in Nixie picklists** — include JXi/LXi heaters in heat mode and heat source picklists for Nixie systems (#1128).
+16. **StateSocket update condition** — replace else-if with if for state update condition to ensure all state changes are emitted.
+17. **WebSocket pdata guard** — skip update when websocket pdata is not enabled to prevent null reference errors.
+18. **Schedule ID offset** — correct schedule ID offset by incrementing ID before lookup (#1199).
+
+## 10.0.0
+**IntelliCenter WebSocket Protocol — Communicate Without RS-485 Hardware**
+
+This is a landmark release. For the first time, njsPC can communicate with IntelliCenter v3.004+ controllers over the **local network** using Pentair's native JSON WebSocket protocol on port 6680 — no RS-485 adapter, no wiring, no serial bus. Just Ethernet.
+
+The IntelliCenter WS transport is a complete alternative communication path: full bidirectional config reads, live state subscriptions via `NotifyList` push, and circuit/body/schedule control — all over a single TCP connection. Combined with a major board architecture refactoring (dedicated V1, V3, and WS board implementations), this release makes njsPC a truly modular platform for IntelliCenter systems.
+
+### IntelliCenter WebSocket Protocol (Major)
+1. **Full WebSocket transport** — new comms type `ocpws` for IntelliCenter v3 OCP local WebSocket on port 6680. Selectable from dashPanel alongside Local / Network / ScreenLogic / Mock. Mutually exclusive with all RS-485-style transports — opening WS closes RS-485 ports and vice versa, with a hard guard in `Comms.queueSendMessageAsync` that refuses to put any RS-485 frame on the wire while WS is the active transport.
+2. **mDNS auto-discovery** — browse for IntelliCenter OCP devices on the LAN via `GET /config/options/ocpws/search`. Filters `_http._tcp.local` for `Pentair -i -n<alias>` services and returns `[{alias, host, port}]`.
+3. **JSON request/response protocol** — WebSocket client with JSON envelope (`{command, messageID, objectList}`), request/response correlator keyed by messageID, configurable timeout, auto-reconnect, and `RequestParamList` subscription manager that re-subscribes after reconnect.
+4. **Full configuration loading over WS** — `IntelliCenterWSController` translates OCP `GetParamList` responses into njsPC config/state (circuits, bodies, pumps, heaters, schedules, chemistry, valves, covers, remotes, security, general options).
+5. **Live state push** — `NotifyList` subscriptions deliver real-time state changes (circuit on/off, temperatures, pump RPM/watts, heater status) without polling.
+6. **Bidirectional control** — circuit toggle, body heat mode/setpoint, schedule changes, and light commands are sent as `SetParamList` writes over WS.
+7. **REST endpoints** — `/config/options/ocpws/search` (mDNS browse), `/config/options/ocpws/test` (one-shot probe), `/config/options/ocpws/stats` (live connection stats). Stats stream pushed on socket.io channel `icwsStats`.
+8. **dashPanel integration** — new "IntelliCenter Network" port type, host/port/discovery panel with Discover and Test buttons, live stats badge.
+9. **wsToken mapping for light themes** — correct token-to-theme mapping for IntelliCenter light commands over WS, plus fix for OCP theme writes (#1191).
+
+### Architecture Refactoring (Major)
+10. **Dedicated board implementations** — `IntelliCenterBoard.ts` refactored into three focused implementations:
+    - `IntelliCenterV1Board.ts` — RS-485 v1.x protocol (the existing behavior, extracted)
+    - `IntelliCenterWSBoard.ts` — WebSocket-mode board with `reloadConfig` method
+    - `IntelliCenterBoard.ts` — shared base with v3 RS-485 protocol support
+11. **Dynamic board swap** — `Equipment.ts` now swaps the active IntelliCenter board at runtime when the communication type changes between RS-485 and WS (#1090).
+12. **Board factory** — `BoardFactory.ts` updated to instantiate the correct board variant based on connection type and firmware version.
+
+### New Features
+13. **Pump error code parsing** — pump error codes are now decoded into human-readable state descriptions with tracking (#1197).
+14. **EasyTouch Dimmer circuit type** — type 8 (Dimmer) added to circuitFunctions with RS-485 level control support via action 134. Level clamped to valid 30-100% range in 10% steps (#1203).
+
+### Bug Fixes
+15. **Jandy DLE byte-stuffing** — correct implementation of DLE (0x10) escape sequences for Jandy/Zodiac RS-485 protocol, plus temp payload offset fix (#1128).
+16. **Pump remote control reset** — removed spurious remote control reset on pump operation end (#1211).
+17. **Equipment controllerType preservation** — `controllerType` no longer lost on equipment reset when using ocpws transport (#1191).
+18. **Schedule SINGLE type logic** — inverted boolean for `SINGLE` schedule type corrected (#1199).
+19. **WS circuit master reset** — OCP-owned circuits correctly have master reset to 0 on WS initialization (#1199).
+20. **Module sync on WS init** — module[0] synced and stale expansion slots cleared during WebSocket initialization (#1199).
+21. **Schedule field naming** — `schedType` renamed to `scheduleType` for consistency; schedule ID offset corrected (#1090).
+22. **IntelliCenter v3 16-bit body capacity** — v3.004+ encodes body volume as big-endian 16-bit; decoder updated (#1090).
+23. **EasyTouch v3 detection regression** — gated IntelliCenter v3 detection on model2 in {2,3} so EasyTouch (model2 13/14) no longer misrouted into IntelliCenter parser (#1195).
+24. **Schedule endTime refresh** — `cstate.endTime` now refreshes when an active schedule's window advances past midnight, preventing spurious circuit shutoff (#1193).
+25. **Schedule yesterday-branch endTime** — fixed assignment of `startTime` where `endTime` was intended in the yesterday-branch of `calcScheduleDate` (#1191).
+26. **Docker bindings** — web/bindings files added to Dockerfile for correct connection bindings in container deployments (#1202).
+27. **Heliotrope duplicate warnings** — suppressed repeated sunrise/sunset calculation warnings and guarded against missing values (#1184).
+28. **Jandy checksum index** — checksum calculation now starts at correct byte index for Jandy protocol (#1128).
+
+### Security
+29. The OCP local WebSocket has **no authentication** — any LAN device can read or write the full system, including PIN-based PERMIT roles in plaintext. Operators must treat port 6680 as trusted-LAN-only and never expose it to the internet.
+
+### Build & Testing
+30. **Integration test infrastructure** — full vitest-based integration test suite with OCP WebSocket mock client, njsPC lifecycle helpers, transport toggle utilities, and structured test reporters.
+31. **Golden snapshot testing** — v1-init and v3-init fixture snapshots for regression testing of configuration parsing.
+32. **Utility scripts** — `capture-snapshot.ts`, `command-replay.ts`, `diff-rs485-vs-ws.ts`, `diff-snapshots.ts` for development and debugging.
+33. **Dependencies** — added `ws` and `@types/ws` for native WebSocket support.
+
+## 9.1.0
+IntelliCenter security rationalization, JXi/LXi heater support, virtual IntelliChem, and various fixes.
+
+### Security
+1. IntelliCenter v3 PIN-based security: full role management with up to 9 roles, 22-section granular permissions, session timeout with activity tracking, and server-side write protection on `/config/*` routes.
+2. dashPanel security integration: Guest mode auto-session on page load, "Guest" badge, config tab gating by permission bitmask, dashboard widget permission gating (bodies, circuits, lights, chemistry, pumps), PIN dialog via lock icon, and session timeout auto-revert.
+3. Permission bit map empirically verified against OCP firmware (bit order differs from OCP display order).
+
+### New Features
+4. Jandy JXi/LXi heater RS485 protocol support with fault message handling (#1128).
+5. Virtual IntelliChem support with alarm sync and API routes for testing without hardware.
+6. Virtual chlorinator support with full emulation of chlorinator protocol responses.
+7. Chlorinator comms-lost alert from Action 204 byte 34.
+8. Configurable single mixing period option for chemistry controllers (#1181). Thanks to @johnny2678.
+9. IntelliBrite light sequencing delay detection: OCP/ICP "gray-out" state now propagates to dashPanel via inbound A184 channel 0x94AF decode. Circuit button dims and disables clicks during theme sequencing.
+10. v3 light group Swim/Set/Sync commands: dashPanel triggers via v3 A184 protocol (channel 0x58A3, target 0x8AB1) instead of v1 rapid-toggle sequencing. Group and member circuits show disabled state until OCP confirms completion.
+11. Automatic lat/lon resolution from zip code: heliotrope sunrise/sunset calculations now fall back to a bundled US zip code coordinate table when latitude/longitude are not explicitly configured or provided via environment variables.
+12. Alert notification management: full PUT `/config/alerts` endpoint for all 7 alert categories (circuits, pumps, ultratemp, chlorinator, intellichem, hybrid, connected gas) with Select All / Select None support. dashPanel pnlAlerts config UI with per-category accordion, checkbox list, and real-time selected/total counts.
+13. ICP→dashPanel alert sync: alert notification changes made on ICP now propagate to dashPanel in real-time via A168 cat=13 piggyback handler in the v3 early-return guard (same pattern as ISSUE-073 body capacity).
+14. v3 delay configuration: freeze cycle time, valve delay, and cooldown delay now decoded from A30 cat=0 sub=0 and writable via A168. dashPanel Delays panel binds `valveDelay` for ICv3 (was `pumpDelay`). Cancel delay endpoint added (`PUT /state/cancelDelay`).
+15. v3 Timed Service Mode (Timeout) detection from A204 byte 9 bit 1.
+16. Remote control configuration: virtualCircuits byteValueMap corrected for remote button context with missing entries added (All Lights On/Off, Pool Heat Enable). dashPanel iS10 body selection locked to Spa.
+17. Cover configuration fixes: circuit IDs corrected for 0-indexed wire protocol, body flags bit 3 polarity fixed (set=Spa not Pool), dashPanel cover config excludes Pool/Spa body circuits. Homepage Covers section added with valve-style widget.
+18. v3 circuit group toggle fix: API now sends on correct A184 channel (0x58A3 instead of 0x688F). ICP-initiated light group theme changes propagate sequencing state to dashPanel.
+19. Freeze protection manual override detection: A204 byte[47] decoded as per-body override bitmask (bit 0=Pool, bit 1=Spa). New `manualFreezeOverride` boolean on body state distinguishes normal freeze cycling from user-initiated override. Smart body toggle forces ON during freeze (prevents accidental OFF).
+20. dashPanel freeze protection UI: green indicator for freeze cycle, blue for manual override, subtitle text ("Freeze Cycle" / "Manual Override"), enhanced banner with per-body override detail.
+
+### Bug Fixes
+21. IntelliCenter v3 circuit/light group eggTimer offset regression: outbound A168 cat=6 now sends 45-byte payload with eggTimer at bytes 40-41 (was incorrectly at 38-39). Inbound ExternalMessage.processGroupSettings also reads v3 offset. Added processEggTimer protection guard against OCP overwriting valid local values with 0.
+22. IntelliCenter V3 chlorinator: fixed payload format, improved superChlor handling, debounced spurious 255 values.
+23. JXi burner-on status: use bitmask check instead of equality for reliable detection.
+24. JXi/LXi heater: default RS485 address to 0x68/0x38.
+25. EquipmentStateMessage: header byte check to disambiguate IntelliCenter from IntelliTouch i9+3 (#1179).
+26. IntelliCenterBoard: process 3rd power center expansion modules correctly (#1171).
+27. Chlorinator ID fallback when `useChlorinator` is true in `setORPAsync`. Thanks to @johnny2678 — [PR #1178](https://github.com/tagyoureit/nodejs-poolController/pull/1178).
+28. Hayward remote control handler: fix no-op catch (#1182).
+29. ChemDoser: simplify singleMixPeriod loop.
+30. IntelliCenter v3 expansion panel decoding and plugin address management improvements.
+31. Schedule calculation crash when heliotrope invalid: `calcAdjustedTimes` now guards against undefined `dt` and missing lat/lon; `calcSchedule` null-checks `endTime` before calling `.getTime()`.
+32. Schedule `nsod` (tomorrow start-of-day) was calculated as yesterday due to copy-paste typo (`addHours(-24)` → `addHours(24)`).
+33. Alert bitmask mixed endianness: 4-byte selectors (IntelliChem, Hybrid) use little-endian while 1-2 byte selectors use big-endian. Encode (`maskToBytes`), decode (`extractAlertMask`), and piggyback decode (`applyAlertNotificationFromExternal`) all branch on byte count.
+34. A168 cat=11 security role write: fixed phantom duplicate creation from incorrect byte[2] and trailing bytes.
+35. dashPanel Save Remote response wrapper not unwrapped — `dataBind` crash on `type.desc` fixed.
+36. dashPanel freeze state race condition: body socket event fires before A204 byte[47] decode completes. Controller `state/all` handler now updates body labels and indicators atomically from the authoritative snapshot data.
+37. RunOnce schedule type: skip `recalc` check that incorrectly expired one-shot schedules.
+
+## 9.0.0
+Focused release on IntelliCenter v3.008 firmware compatibility, finishing the v3 work started in 8.4.1, plus the Regal Century pump Modbus fixes.
+
+1. IntelliCenter v3.008 chlorinator support: row-major stride-9 decoder for Action 30 cat=7 sub=0 payloads and live-edit piggyback on Action 168 cat=7.
+2. v3 state polling so feature and circuit changes from the panel appear in dashPanel within seconds instead of ~30s.
+3. v3 heater management: ETI250 (type 8), expanded heater type/mode coverage, and improved control-path handling.
+4. v3 body handling: body capacity updates from ExternalMessage and enhanced unit handling.
+5. v3 light group state management improvements (sync-back, theme/color updates, stuck-action clearing).
+6. v3 firmware change detection so configuration reloads when the OCP firmware version shifts.
+7. Circuit management enhancements in IntelliCenterBoard and CircuitCommands; `getCircuitFunctions` retains pool/spa options across call sites.
+8. Virtual equipment management with new API endpoints.
+9. Equipment item queuing refactor in `IntelliCenterConfigQueue` for v3 compatibility.
+10. Regal (Century) Modbus pump now supported as equipment in Nixie: improved collision detection, header validation via `pumpTypes` (accepts messages only from configured RegalModbus pumps), and NACK/fault response handling on Go/Stop commands (0x41/0x42). Thanks to @celestinjr — [PR #1169](https://github.com/tagyoureit/nodejs-poolController/pull/1169).
+
+## 8.4.1
+Major v3.004+ IntelliCenter refinement release covering three months of work on top of 8.4.0.
+
+1. IntelliCenter v3.004+ circuit control via indexed Action 184 frames with learned target IDs and collision prevention; Action 168 no longer used for v3 circuit on/off.
+2. v3.004+ feature handling: features use the new [232,157] payload block; feature state delegated through the circuit path; config requests piggyback on confirmations instead of debouncing.
+3. Big-endian payload handling across v3.004+ (pumps, schedules, options) with a unified `readInt` helper.
+4. v3.004+ pump configuration: speed/flow encoding, forced refresh on WCP changes, destination addressing, and streamlined payload processing.
+5. v3.004+ temperature and location handling: variable payload offsets for Action 168 temp settings, latitude/longitude calculation accuracy, and proper refresh on general configuration updates.
+6. Freeze cycle and freeze override settings exposed on Equipment and IntelliCenter classes.
+7. Watchdog functionality added to IntelliCenter configuration handling.
+8. Alerts functionality in Equipment and related classes — OCP alert state surfaced to dashPanel / API.
+9. IntelliChem standalone mode for configurations without an OCP chemistry controller.
+10. Nixie: Neptune Modbus pump support added to NixieBoard.
+11. Nixie: NixieChemPump syncs circuit states instead of feature states (aligns relay bindings with the hardware-bound source of truth).
+12. OCP write security enforcement in ConfigRoute — blocks mutations when OCP write is disallowed.
+13. New `ultratempdirect` heater type for direct RS-485 UltraTemp control.
+14. `*Touch` heat source/mode handling: `ultratemp` transforms to `heatpump` when undefined; OCP ghost heaters suppressed based on NCP control (#1116, #1060).
+15. WaterColors light circuit support in circuit state management.
+16. `assertSinglePoolSpaType` validation across boards to prevent invalid pool/spa circuit type combinations.
+17. Hayward outbound action matching restored — response-level action index mismatch fix for non-IntelliCenter protocols (#1151).
+18. Scope conditionally set in IntelliCenterBoard based on equipment version.
+19. docker-compose.yml + README updates for local development and image channel clarity.
+20. dashPanel image reference updates.
+21. TypeScript config tweak to skip library checks for faster builds.
+
+## 8.4.0
+1. IntelliCenter v3.004+ support (still being refined): registration handling, config refresh/ACK handling, and improved source-of-truth processing to keep state accurate.
+2. IntelliCenter v3.004+ circuit control updates: Action 184 support with learned Target IDs for more reliable circuit on/off behavior.
+3. IntelliCenter v3.004+ protocol parsing fixes: byte shift handling for Wireless messages, big-endian schedule times, and options/setpoint processing improvements.
+4. More resilience and reduced noise: improved initialization/race handling, better scoped logging, and longer device announce intervals.
+5. Misc fixes: default chlorinator naming and other small stability improvements.
+6. Huge thanks to @jwtaylor310 for providing a ton of replay captures that helped track down and fix bugs.
+
 ## 8.3.0
 1. Configurable RS‑485 transmit pacing via new `controller.txDelays` for finer collision avoidance and throughput tuning.
 2. Startup & config resilience: empty or invalid `config.json` now auto‑recreated from defaults, corrupt originals backed up.
@@ -46,7 +238,7 @@
 1. Refactor comms code to Async
 2. Update dependencies and Node >16
 3. EasyTouch v1 support
-4. Screenlogic support
+4. Screenlogic support — can now be used as a direct connection point for users who don't want to integrate an RS-485 adapter. RS-485 is still the preferred method as it is more fully featured.
 5. Anslq25 (Mock controller)
 
 ## 7.7.0
@@ -114,9 +306,10 @@
 4. Outbound processing for packets now has a scope.  Previously if an outbound packet would receive a response we would clear all of the similar packets off the queue.  EG if a user requests circuit 2 and 3 to be turned on, we would clear out the outbound message for 3.  Now the code is more selective about what "scope" is considered for a successful response.
 
 ## 7.0.0
-1. Upgrades to setup/sync between njsPC and REM
+1. Upgrades to setup/sync between njsPC and REM (Relay Equipment Manager) — tight integration providing hardware control over ancillary pool equipment (chemical probes, pumps, tanks, heaters, etc).
 2. Significant steps to njsPC (Nixie) acting as a standalone pool controller (virtual controller heaters, move virtual controller code, etc.)
 3. Dependency updates (Typescript 4, Socket.io 4, etc)
+4. Branch policy change: starting with this version, all code is pushed immediately to `master`. The `next` branch for feature development is retired.
 
 ## 6.5.2
 1. Bug Fixes

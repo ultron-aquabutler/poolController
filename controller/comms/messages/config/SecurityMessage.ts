@@ -17,23 +17,46 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 import { Inbound } from "../Messages";
 import { sys, SecurityRole } from "../../../Equipment";
+import { logger } from "../../../../logger/Logger";
 
 export class SecurityMessage {
     public static process(msg: Inbound): void {
-        var role: SecurityRole;
-        switch (msg.extractPayloadByte(1)) {
-            case 0:
-                sys.security.enabled = (msg.extractPayloadByte(3) & 1) === 1;
-                sys.security.roles.clear();
-                break;
-        }
-        if ((msg.extractPayloadByte(3) & 2) === 2) {
-            role = sys.security.roles.getItemById(msg.extractPayloadByte(1) + 1, true);
-            role.name = msg.extractPayloadString(4, 16);
-            role.timeout = msg.extractPayloadByte(20);
-            role.flag1 = msg.extractPayloadByte(2);
-            role.flag2 = msg.extractPayloadByte(3);
-            role.pin = msg.extractPayloadByte(21).toString() + msg.extractPayloadByte(22).toString() + msg.extractPayloadByte(23).toString() + msg.extractPayloadByte(24).toString();
+        const item = msg.extractPayloadByte(1, 0);
+        const roleId = item + 1;
+        const roleName = msg.extractPayloadString(5, 16).trim();
+        const pinNumber = ((msg.extractPayloadByte(3, 0) & 0xFF) << 8) | (msg.extractPayloadByte(4, 0) & 0xFF);
+        const timeout = msg.extractPayloadByte(25, 0);
+        const permissionsBytes = [
+            msg.extractPayloadByte(21, 0),
+            msg.extractPayloadByte(22, 0),
+            msg.extractPayloadByte(23, 0),
+            msg.extractPayloadByte(24, 0)
+        ];
+        const permissionsMask =
+            ((permissionsBytes[0] & 0xFF) * 16777216) +
+            ((permissionsBytes[1] & 0xFF) * 65536) +
+            ((permissionsBytes[2] & 0xFF) * 256) +
+            (permissionsBytes[3] & 0xFF);
+        const hasRoleData = item === 0 || roleName.length > 0 || permissionsMask > 0;
+
+        logger.debug(`SecurityMessage: item=${item} roleId=${roleId} name="${roleName}" pin=${pinNumber.toString().padStart(4, '0')} timeout=${timeout} bytes=[${permissionsBytes}] mask=0x${permissionsMask.toString(16).padStart(8, '0')} hasData=${hasRoleData}`);
+
+        if (hasRoleData) {
+            const role: SecurityRole = sys.security.roles.getItemById(roleId, true);
+            role.name = roleName;
+            role.timeout = timeout;
+            role.flag1 = msg.extractPayloadByte(2, 0);
+            role.flag2 = msg.extractPayloadByte(24, 0);
+            role.pin = pinNumber.toString().padStart(4, '0');
+            role.permissionsMask = permissionsMask;
+            role.permissionsBytes = permissionsBytes;
+            if (item === 0) {
+                sys.security.enabledByte = permissionsBytes[3];
+                sys.security.enabled = (permissionsBytes[3] & 0x80) === 0x80;
+                sys.security.guestEnabled = (permissionsBytes[3] & 0x40) === 0x40;
+            }
+        } else {
+            sys.security.roles.removeItemById(roleId);
         }
         msg.isProcessed = true;
     }

@@ -34,7 +34,7 @@ export class ScheduleMessage {
     // Run once
     // [165, 63, 15, 16, 30, 42][3, 8, 128, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][2, 86]
     // [165, 63, 15, 16, 30, 42][3, 8, 129, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][2, 87]
-    public static _maxSchedId: number = 0;
+    public static get _maxSchedId(): number { return sys.equipment.maxSchedules; }
     public static process(msg: Inbound): void {
         if (sys.controllerType === ControllerType.IntelliCenter)
             switch (msg.extractPayloadByte(1)) {
@@ -47,6 +47,7 @@ export class ScheduleMessage {
                     break;
                 case 5:
                 case 6:
+                case 7:
                     ScheduleMessage.processCircuit(msg);
                     break;
                 case 8: // Schedule Type
@@ -225,7 +226,7 @@ export class ScheduleMessage {
     }
     private static processStartMonth(msg: Inbound) {
         let schedId = (msg.extractPayloadByte(1) - 14) * 40 + 1;
-        for (let i = 1; i < msg.payload.length && schedId <= ScheduleMessage._maxSchedId; i++) {
+        for (let i = 1; i < msg.payload.length - 1 && schedId <= ScheduleMessage._maxSchedId; i++) {
             const schedule: Schedule = sys.schedules.getItemById(schedId++, false, { isActive: false });
             if (schedule.isActive !== false) schedule.startMonth = msg.extractPayloadByte(i + 1);
         }
@@ -233,7 +234,7 @@ export class ScheduleMessage {
     }
     private static processStartDay(msg: Inbound) {
         let schedId = (msg.extractPayloadByte(1) - 17) * 40 + 1;
-        for (let i = 1; i < msg.payload.length && schedId <= ScheduleMessage._maxSchedId; i++) {
+        for (let i = 1; i < msg.payload.length - 1 && schedId <= ScheduleMessage._maxSchedId; i++) {
             const schedule: Schedule = sys.schedules.getItemById(schedId++, false, { isActive: false });
             if (schedule.isActive !== false) {
                 schedule.startDay = msg.extractPayloadByte(i + 1);
@@ -245,7 +246,7 @@ export class ScheduleMessage {
     }
     private static processStartYear(msg: Inbound) {
         let schedId = (msg.extractPayloadByte(1) - 20) * 40 + 1;
-        for (let i = 1; i < msg.payload.length && schedId <= ScheduleMessage._maxSchedId; i++) {
+        for (let i = 1; i < msg.payload.length - 1 && schedId <= ScheduleMessage._maxSchedId; i++) {
             const schedule: Schedule = sys.schedules.getItemById(schedId++, false, { isActive: false });
             if (schedule.isActive !== false) {
                 schedule.startYear = msg.extractPayloadByte(i + 1);
@@ -258,7 +259,12 @@ export class ScheduleMessage {
         for (let i = 1; i < msg.payload.length - 1 && schedId <= ScheduleMessage._maxSchedId;) {
             let schedule: Schedule = sys.schedules.getItemById(schedId++, false, { isActive: false });
             if (schedule.isActive) {
-                schedule.startTime = msg.extractPayloadInt(i + 1);
+                if (sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3) {
+                    schedule.startTime = (msg.extractPayloadByte(i + 1) * 256) + msg.extractPayloadByte(i + 2);
+                }
+                else {
+                    schedule.startTime = msg.extractPayloadInt(i + 1);
+                }
                 let csched = state.schedules.getItemById(schedule.id, true);
                 csched.startTime = schedule.startTime;
             }
@@ -269,7 +275,11 @@ export class ScheduleMessage {
     private static processEndTimes(msg: Inbound) {
         let schedId = (msg.extractPayloadByte(1) - 23) * 20 + 1;
         for (let i = 1; i < msg.payload.length - 1 && schedId <= ScheduleMessage._maxSchedId;) {
-            const time = msg.extractPayloadInt(i + 1);
+            // v3.004+: schedule times are big-endian (hi,lo) in Action 30 payloads.
+            // v1.x: schedule times are little-endian (lo,hi).
+            const time = (sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3)
+                ? ((msg.extractPayloadByte(i + 1) * 256) + msg.extractPayloadByte(i + 2))
+                : msg.extractPayloadInt(i + 1);
             const schedule: Schedule = sys.schedules.getItemById(schedId++, false, { isActive: false });
             if (schedule.isActive !== false) {
                 schedule.endTime = time;
@@ -282,13 +292,12 @@ export class ScheduleMessage {
     }
     private static processCircuit(msg: Inbound) {
         let schedId = (msg.extractPayloadByte(1) - 5) * 40 + 1;
-        for (let i = 1; i < msg.payload.length && schedId <= ScheduleMessage._maxSchedId; i++) {
+        for (let i = 1; i < msg.payload.length - 1 && schedId <= ScheduleMessage._maxSchedId; i++) {
             let schedule: Schedule = sys.schedules.getItemById(schedId++, false, { isActive: false });
             if (schedule.isActive) {
                 let csched = state.schedules.getItemById(schedule.id, true);
                 schedule.circuit = msg.extractPayloadByte(i + 1) + 1;
                 if (schedule.circuit === 256 || schedule.circuit === 0) {
-                    // This is some of the IntelliCenter craziness where the schedule is marked as active but the circuit is not defined.
                     csched.isActive = false;
                     state.schedules.removeItemById(schedule.id);
                     sys.schedules.removeItemById(schedule.id);
@@ -301,7 +310,7 @@ export class ScheduleMessage {
     }
     private static processScheduleType(msg: Inbound) {
         let schedId = (msg.extractPayloadByte(1) - 8) * 40 + 1;
-        for (let i = 1; i < msg.payload.length; i++) {
+        for (let i = 1; i < msg.payload.length - 1; i++) {
             let byte = msg.extractPayloadByte(i + 1);
             let schedule: Schedule = sys.schedules.getItemById(schedId++, (byte & 128) === 128);
             if ((byte & 128) === 128) {
@@ -310,6 +319,7 @@ export class ScheduleMessage {
                 schedule.isActive = true;
                 schedule.master = 0;
                 schedule.scheduleType = (byte & 1 & 0xFF) === 1 ? 0 : 128;
+                schedule.schedGroup = (byte & 0x40) ? 1 : 0;
                 if ((byte & 4 & 0xFF) === 4) schedule.startTimeType = 1;
                 else if ((byte & 8 & 0xFF) === 8) schedule.startTimeType = 2;
                 else schedule.startTimeType = 0;
@@ -322,6 +332,7 @@ export class ScheduleMessage {
                 csched.startTimeType = schedule.startTimeType;
                 csched.endTimeType = schedule.endTimeType;
                 csched.scheduleType = schedule.scheduleType;
+                csched.schedGroup = schedule.schedGroup;
             }
             else {
                 // Now we need to remove this pig because this is not an active schedule.
@@ -333,12 +344,11 @@ export class ScheduleMessage {
                 state.schedules.removeItemById(schedule.id);
             }
         }
-        ScheduleMessage._maxSchedId = sys.schedules.getMaxId(true, 0);
         msg.isProcessed = true;
     }
     private static processDays(msg: Inbound) {
         let schedId = (msg.extractPayloadByte(1) - 11) * 40 + 1;
-        for (let i = 1; i < msg.payload.length && schedId <= ScheduleMessage._maxSchedId; i++) {
+        for (let i = 1; i < msg.payload.length - 1 && schedId <= ScheduleMessage._maxSchedId; i++) {
             let schedule: Schedule = sys.schedules.getItemById(schedId++, false, { isActive: false });
             if (schedule.isActive !== false) {
                 schedule.scheduleDays = msg.extractPayloadByte(i + 1);
@@ -350,7 +360,7 @@ export class ScheduleMessage {
     }
     private static processHeatSource(msg: Inbound) {
         let schedId = (msg.extractPayloadByte(1) - 28) * 40 + 1;
-        for (let i = 1; i < msg.payload.length && schedId <= ScheduleMessage._maxSchedId; i++) {
+        for (let i = 1; i < msg.payload.length - 1 && schedId <= ScheduleMessage._maxSchedId; i++) {
             let schedule: Schedule = sys.schedules.getItemById(schedId++, false, { isActive: false });
             if (schedule.isActive !== false) {
                 let hs = msg.extractPayloadByte(i + 1);
@@ -365,7 +375,7 @@ export class ScheduleMessage {
     }
     private static processHeatSetpoint(msg: Inbound) {
         let schedId = (msg.extractPayloadByte(1) - 31) * 40 + 1;
-        for (let i = 1; i < msg.payload.length && schedId <= ScheduleMessage._maxSchedId; i++) {
+        for (let i = 1; i < msg.payload.length - 1 && schedId <= ScheduleMessage._maxSchedId; i++) {
             let schedule: Schedule = sys.schedules.getItemById(schedId++, false, { isActive: false });
             if (schedule.isActive !== false) {
                 schedule.heatSetpoint = msg.extractPayloadByte(i + 1);
@@ -377,7 +387,7 @@ export class ScheduleMessage {
     }
     private static processCoolSetpoint(msg: Inbound) {
         let schedId = (msg.extractPayloadByte(1) - 34) * 40 + 1;
-        for (let i = 1; i < msg.payload.length && schedId <= ScheduleMessage._maxSchedId; i++) {
+        for (let i = 1; i < msg.payload.length - 1 && schedId <= ScheduleMessage._maxSchedId; i++) {
             let schedule: Schedule = sys.schedules.getItemById(schedId++, false, { isActive: false });
             if (schedule.isActive !== false) {
                 schedule.coolSetpoint = msg.extractPayloadByte(i + 1);

@@ -399,6 +399,27 @@ export class StateRoute {
             }
             catch (err) { next(err); }
         });
+        app.put('/state/light/setBrightness', async (req, res, next) => {
+            try {
+                let cstate = await sys.board.circuits.setDimmerLevelAsync(
+                    parseInt(req.body.id, 10),
+                    parseInt(typeof req.body.level !== 'undefined' ? req.body.level : req.body.brightness, 10)
+                );
+                return res.status(200).send(cstate.get(true));
+            }
+            catch (err) { next(err); }
+        });
+        app.put('/state/light/setColor', async (req, res, next) => {
+            try {
+                let cstate = await sys.board.circuits.setLightColorAsync(parseInt(req.body.id, 10), {
+                    red: parseInt(typeof req.body.red !== 'undefined' ? req.body.red : req.body.r, 10),
+                    green: parseInt(typeof req.body.green !== 'undefined' ? req.body.green : req.body.g, 10),
+                    blue: parseInt(typeof req.body.blue !== 'undefined' ? req.body.blue : req.body.b, 10)
+                });
+                return res.status(200).send(cstate.get(true));
+            }
+            catch (err) { next(err); }
+        });
         app.put('/state/feature/setState', async (req, res, next) => {
             try {
                 let isOn = utils.makeBool(typeof req.body.isOn !== 'undefined' ? req.body.isOn : req.body.state);
@@ -445,7 +466,7 @@ export class StateRoute {
                 if (typeof req.body.heatSetpoint !== 'undefined' && !isNaN(parseInt(req.body.heatSetpoint, 10)))
                     await sys.board.bodies.setHeatSetpointAsync(body, parseInt(req.body.heatSetpoint, 10));
                 else if (typeof req.body.setPoint !== 'undefined' && !isNaN(parseInt(req.body.setPoint, 10)))
-                    await sys.board.bodies.setHeatSetpointAsync(body, parseInt(req.body.setpoint, 10));
+                    await sys.board.bodies.setHeatSetpointAsync(body, parseInt(req.body.setPoint, 10));
                 let tbody = state.temps.bodies.getItemById(body.id);
                 return res.status(200).send(tbody.get(true));
             } catch (err) { next(err); }
@@ -518,21 +539,21 @@ export class StateRoute {
         });
         app.put('/state/lightGroup/:id/colorSync', async (req, res, next) => {
             try {
-                let sgroup = await sys.board.circuits.sequenceLightGroupAsync(parseInt(req.params.id, 10), 'colorsync');
+                let sgroup = await sys.board.circuits.runLightGroupCommandAsync({ id: parseInt(req.params.id, 10), command: 'colorsync' });
                 return res.status(200).send(sgroup.get(true));
             }
             catch (err) { next(err); }
         });
         app.put('/state/lightGroup/:id/colorSet', async (req, res, next) => {
             try {
-                let sgroup = await sys.board.circuits.sequenceLightGroupAsync(parseInt(req.params.id, 10), 'colorset');
+                let sgroup = await sys.board.circuits.runLightGroupCommandAsync({ id: parseInt(req.params.id, 10), command: 'colorset' });
                 return res.status(200).send(sgroup.get(true));
             }
             catch (err) { next(err); }
         });
         app.put('/state/lightGroup/:id/colorSwim', async (req, res, next) => {
             try {
-                let sgroup = await sys.board.circuits.sequenceLightGroupAsync(parseInt(req.params.id, 10), 'colorswim');
+                let sgroup = await sys.board.circuits.runLightGroupCommandAsync({ id: parseInt(req.params.id, 10), command: 'colorswim' });
                 return res.status(200).send(sgroup.get(true));
             }
             catch (err) { next(err); }
@@ -578,6 +599,12 @@ export class StateRoute {
         });
         app.get('/state/emitAll', (req, res) => {
             res.status(200).send(state.emitAllEquipmentChanges());
+        });
+        app.put('/state/cancelDelay', async (req, res, next) => {
+            try {
+                let result = await (sys.board as any).cancelDelay();
+                return res.status(200).send(result);
+            } catch (err) { next(err); }
         });
         app.get('/state/:section', (req, res) => {
             res.status(200).send(state.getState(req.params.section));

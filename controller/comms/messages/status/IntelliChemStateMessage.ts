@@ -21,6 +21,7 @@ import { sys, ControllerType } from "../../../Equipment";
 import { logger } from "../../../../logger/Logger";
 import { webApp } from "../../../../web/Server";
 import { Timestamp, utils } from "../../../Constants"
+import { EquipmentStateMessage } from "./EquipmentStateMessage";
 export class IntelliChemStateMessage {
     public static process(msg: Inbound) {
         if (sys.controllerType === ControllerType.Unknown) return;
@@ -44,6 +45,12 @@ export class IntelliChemStateMessage {
                 if (schem.lastComm + (30 * 1000) < new Date().getTime()) {
                     // We have not talked to the chem controller in 30 seconds so we have lost communication.
                     schem.status = schem.alarms.comms = 1;
+                    const ccode = `intellichem:${controller.id}:comms`;
+                    if (EquipmentStateMessage.isA204AlertEnabled('intellichem', 13)) {
+                        state.equipment.messages.setMessageByCode(ccode, 'error', `Communication error with ${controller.name || 'IntelliChem ' + controller.id}`);
+                    } else if (state.equipment.messages.exists((m: any) => m.code === ccode)) {
+                        state.equipment.messages.removeItemByCode(ccode);
+                    }
                 }
                 msg.isProcessed = true;
                 break;
@@ -259,6 +266,27 @@ export class IntelliChemStateMessage {
         if (schem.saturationIndex > chem.lsiRange.high) schem.warnings.waterChemistry = 2;
         else if (schem.saturationIndex < chem.lsiRange.low) schem.warnings.waterChemistry = 1;
         else schem.warnings.waterChemistry = 0;
+
+        const icName = chem.name || `IntelliChem ${chem.id}`;
+        const syncMsg = (code: string, active: boolean, message: string) => {
+            // Honor sys.alerts.intellichemNotifications on IC v3 (resolveA204AlertVisibility
+            // returns undefined for non-comms intellichem codes, leaving them unfiltered).
+            const vis = EquipmentStateMessage.resolveA204AlertVisibility(code);
+            const visible = vis ? EquipmentStateMessage.isA204AlertEnabled(vis.category, vis.bit) : true;
+            const shouldShow = active && visible;
+            if (shouldShow) state.equipment.messages.setMessageByCode(code, 'error', message);
+            else state.equipment.messages.removeItemByCode(code);
+        };
+        syncMsg(`intellichem:${chem.id}:comms`, schem.alarms.comms > 0, `Communication error with ${icName}`);
+        syncMsg(`intellichem:${chem.id}:flow`, alarms.flow > 0, `${icName}: No water flow detected`);
+        syncMsg(`intellichem:${chem.id}:ph`, alarms.pH > 0, `${icName}: pH level alarm`);
+        syncMsg(`intellichem:${chem.id}:orp`, alarms.orp > 0, `${icName}: ORP level alarm`);
+        syncMsg(`intellichem:${chem.id}:phtank`, alarms.pHTank > 0, `${icName}: pH tank empty`);
+        syncMsg(`intellichem:${chem.id}:orptank`, alarms.orpTank > 0, `${icName}: ORP tank empty`);
+        syncMsg(`intellichem:${chem.id}:probe`, alarms.probeFault > 0, `${icName}: Probe fault`);
+        syncMsg(`intellichem:${chem.id}:waterchemistry`, schem.warnings.waterChemistry > 0, 
+            schem.warnings.waterChemistry === 2 ? `${icName}: Scaling may occur` : `${icName}: Corrosion may occur`);
+
         if (typeof chem.body === 'undefined') chem.body = schem.body = 0;
         if (state.equipment.controllerType === 'nixie') {
             if (chem.ph.probe.feedBodyTemp) {

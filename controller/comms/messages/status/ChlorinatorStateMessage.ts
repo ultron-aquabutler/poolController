@@ -18,8 +18,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 import { Inbound, Protocol } from "../Messages";
 import { state, BodyTempState, ChlorinatorState } from "../../../State";
 import { sys, ControllerType, Chlorinator } from "../../../Equipment";
+import { logger } from "../../../../logger/Logger";
 
 export class ChlorinatorStateMessage {
+    // Ephemeral, session-only set of model strings we have already warned about.  Prevents the unrecognized-model
+    // log below from repeating on every poll cycle, since getModelAsync() runs inside the Nixie poll loop.
+    private static _loggedUnknownModels: Set<string> = new Set<string>();
     public static process(msg: Inbound) {
         if (msg.protocol === Protocol.Chlorinator) {
             // RKS: 03-29-22 A lot of water has gone under the bridge at this point and we know much more.  First there are two types of messages.  Those inbound
@@ -40,6 +44,7 @@ export class ChlorinatorStateMessage {
                 else if (cstate.lastComm + (30 * 1000) < new Date().getTime()) {
                     // We have not talked to the chlorinator in 30 seconds so we have lost communication.
                     cstate.status = 128;
+                    state.equipment.messages.setMessageByCode(`chlorinator:${chlor.id}:comms`, 'error', `Communication error with ${cstate.name || chlor.name}`);
                 }
                 // chlor = sys.chlorinators.getItemById(msg.dest - 79, true); chlor is retrieved above; don't get in incorrectly here.
                 chlor.address = msg.dest; // Theoretically, this will always be 80.
@@ -49,7 +54,10 @@ export class ChlorinatorStateMessage {
                 // Response message from chlorinator.  If the chlorinator is speaking to us then we need to hear it and clear the status when
                 // the previous status was no comms.
                 cstate.lastComm = new Date().getTime();
-                if (cstate.status === 128) cstate.status = 0;
+                if (cstate.status === 128) {
+                    cstate.status = 0;
+                    state.equipment.messages.removeItemByCode(`chlorinator:${chlor.id}:comms`);
+                }
             }
             cstate.body = chlor.body;
             switch (msg.action) {
@@ -74,6 +82,15 @@ export class ChlorinatorStateMessage {
                         // With iChlor it does not report the model.
                         if (typeof chlor.model === 'undefined') {
                             if (name.startsWith('iChlor')) chlor.model = sys.board.valueMaps.chlorinatorModel.getValue('ichlor-ic30');
+                        }
+                        // RG: 08-24-26 -- We have no capture of the model string reported by the IntelliChlor Plus/LT
+                        // series.  Log it rather than guess so it can be mapped once a real capture is available.  We
+                        // deliberately leave chlor.model unset here so any model the user selected manually survives.
+                        // Logged once per distinct string because this path runs on every poll cycle.
+                        // See .plan/503-pentair-intellichlor-plus-lt.md.
+                        if (typeof chlor.model === 'undefined' && !ChlorinatorStateMessage._loggedUnknownModels.has(name)) {
+                            ChlorinatorStateMessage._loggedUnknownModels.add(name);
+                            logger.info(`Unrecognized chlorinator model reported: '${name}'. Please report this string along with your cell model. ${msg.toPacket()}`);
                         }
                     }
                     cstate.isActive = chlor.isActive;
@@ -118,7 +135,7 @@ export class ChlorinatorStateMessage {
                     // source like REM.
                     if (!chlor.ignoreSaltReading) cstate.saltLevel = msg.extractPayloadByte(0) * 50 || cstate.saltLevel || 0;
                     cstate.status = (msg.extractPayloadByte(1) & 0x007F); // Strip off the high bit.  The chlorinator does not actually report this. 
-                    cstate.currentOutput = chlor.disabled ? 0 : cstate.setPointForCurrentBody;
+                    cstate.currentOutput = chlor.disabled ? 0 : cstate.targetOutput || cstate.setPointForCurrentBody;
                     state.emitEquipmentChanges();
                     break;
                 case 19:

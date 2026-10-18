@@ -28,6 +28,7 @@ import { versionCheck } from '../config/VersionCheck';
 import { DataLogger, DataLoggerEntry } from '../logger/DataLogger';
 import { delayMgr } from './Lockouts';
 import { time } from 'console';
+import { getCoordinatesForZip } from './zipCoords';
 
 export class State implements IState {
     statePath: string;
@@ -85,7 +86,7 @@ export class State implements IState {
         var self = this;
         Promise.resolve()
             .then(() => {
-                fs.writeFileSync(self.statePath, JSON.stringify(self.data, undefined, 2));
+                utils.writeFileAtomicSync(self.statePath, JSON.stringify(self.data, undefined, 2));
             })
             .catch(function (err) { if (err) logger.error('Error writing pool state %s %s', err, self.statePath); });
     }
@@ -217,6 +218,7 @@ export class State implements IState {
             nextSunset: self.data.nextSunset || '',
             alias: sys.general.alias,
             freeze: utils.makeBool(self.data.freeze),
+            vacation: utils.makeBool(self.data.vacation),
             valveMode: self.data.valveMode || {},
         };
     }
@@ -313,6 +315,13 @@ export class State implements IState {
             this.hasChanged = true;
         }
     }
+    public get vacation(): boolean { return this.data.vacation === true; }
+    public set vacation(val: boolean) {
+        if (this.data.vacation !== val) {
+            this.data.vacation = val;
+            this.hasChanged = true;
+        }
+    }
     public get status() { return typeof (this.data.status) !== 'undefined' ? this.data.status.val : -1; }
     public set status(val) {
         if (typeof (val) === 'number') {
@@ -354,6 +363,7 @@ export class State implements IState {
   
         var sdata = this.loadFile(this.statePath, {});
         sdata = extend(true, { mode: { val: -1 }, temps: { units: { val: 0, name: 'F', desc: 'Fahrenheit' } } }, sdata);
+        this.sanitizeTransientLightGroupState(sdata);
         if (typeof sdata.temps !== 'undefined' && typeof sdata.temps.bodies !== 'undefined') {
             EqStateCollection.removeNullIds(sdata.temps.bodies);
         }
@@ -403,6 +413,13 @@ export class State implements IState {
                 if (typeof lon !== 'number' && typeof envLon === 'number' && !isNaN(envLon)) lon = envLon;
                 if (typeof lat !== 'number' && typeof envLat === 'number' && !isNaN(envLat)) lat = envLat;
             }
+            if (typeof lon !== 'number' || typeof lat !== 'number') {
+                const zipCoords = getCoordinatesForZip(loc.zip);
+                if (zipCoords) {
+                    if (typeof lat !== 'number') lat = zipCoords.latitude;
+                    if (typeof lon !== 'number') lon = zipCoords.longitude;
+                }
+            }
             self.heliotrope.longitude = lon;
             self.heliotrope.latitude = lat;
             let times = self.heliotrope.calculatedTimes;
@@ -436,6 +453,16 @@ export class State implements IState {
         this.appVersion = new AppVersionState(this.data, 'appVersion');
         this.data.startTime = Timestamp.toISOLocal(new Date());
         versionCheck.checkGitLocal();
+    }
+    private sanitizeTransientLightGroupState(sdata: any) {
+        if (!sdata || !Array.isArray(sdata.lightGroups)) return;
+        for (let i = 0; i < sdata.lightGroups.length; i++) {
+            const lg = sdata.lightGroups[i];
+            if (!lg || typeof lg !== 'object') continue;
+            // Sequencing state is transient and must never survive process restarts.
+            if (typeof lg.action !== 'undefined') delete lg.action;
+            if (typeof lg.endTime !== 'undefined') delete lg.endTime;
+        }
     }
     public resetData() {
         this.circuitGroups.clear();
@@ -542,6 +569,8 @@ export interface ICircuitState {
     get(bCopy?: boolean);
     showInFeatures?: boolean;
     isActive?: boolean;
+    level?: number;
+    color?: { red: number; green: number; blue: number };
     startDelay?: boolean;
     stopDelay?: boolean;
     manualPriorityActive?: boolean;
@@ -768,6 +797,20 @@ class DirtyStateCollection extends Array<EqState> {
 export class EquipmentState extends EqState {
     public initData() {
         if (typeof this.data.messages === 'undefined') this.data.messages = [];
+        // v3.004+ device registration state
+        // Persisted shape is { status: number } but callers should only set/get the numeric status via accessors.
+        // Normalize legacy persisted shapes (e.g. {status, lastConfirmed} or a raw number) to keep poolState.json clean.
+        const reg = this.data.registration;
+        if (typeof reg === 'undefined') {
+            this.data.registration = { status: 0 };
+        }
+        else if (typeof reg === 'number') {
+            this.data.registration = { status: reg };
+        }
+        else if (reg === null || typeof reg !== 'object' || typeof reg.status !== 'number' || 'lastConfirmed' in reg) {
+            const status = (reg && typeof reg.status === 'number') ? reg.status : 0;
+            this.data.registration = { status };
+        }
     }
     public get controllerType(): string { return this.data.controllerType; }
     public set controllerType(val: string) { this.setDataVal('controllerType', val); }
@@ -801,6 +844,35 @@ export class EquipmentState extends EqState {
     public get maxLightGroups(): number { return this.data.maxLightGroups; }
     public set maxLightGroups(val: number) { this.setDataVal('maxLightGroups', val); }
     public get messages(): EquipmentMessages { return new EquipmentMessages(this.data, 'messages'); }
+    // Current runtime RS-485 bus address njsPC is using (the "plugin address").
+    // For IntelliCenter v3.004+ this can diverge from the configured value at runtime
+    // when the OCP converges njsPC onto the first ICP slot (32 vs 33). dashPanel uses
+    // this to dynamically render the "njsPC" label on whichever slot we're occupying.
+    public get pluginAddress(): number { return typeof this.data.pluginAddress === 'number' ? this.data.pluginAddress : undefined; }
+    public set pluginAddress(val: number) { this.setDataVal('pluginAddress', val); }
+    // v3.004+ device registration state
+    public get registration(): number {
+        const reg = this.data.registration;
+        if (typeof reg === 'number') return reg;
+        if (reg && typeof reg.status === 'number') return reg.status;
+        return 0;
+    }
+    public set registration(val: number) {
+        const reg = this.data.registration;
+        const needsNormalize = (typeof reg !== 'object' || reg === null || typeof reg.status !== 'number' || 'lastConfirmed' in reg);
+        if (this.registration !== val || needsNormalize) {
+            this.data.registration = { status: val };
+            // During module init, `state` may not be constructed yet (State.ts exports `var state = new State()`).
+            // Guard writes that depend on `state`/dirty list.
+            if (typeof state !== 'undefined' && state) {
+                this.hasChanged = true;
+                state.dirty = true;
+            }
+            else {
+                this._hasChanged = true;
+            }
+        }
+    }
     // This could be extended to include all the expansion panels but not sure why.
     public getExtended() {
         let obj = this.get(true);
@@ -883,6 +955,12 @@ export class EquipmentMessages extends EqStateCollection<EquipmentMessage> {
         msg.message = message;
         webApp.emitToClients('sysmessages', this.get(true));
         return msg;
+    }
+    public clearAll() {
+        if (this.data.length > 0) {
+            this.data.length = 0;
+            webApp.emitToClients('sysmessages', this.get(true));
+        }
     }
 }
 export class EquipmentMessage extends ChildEqState {
@@ -984,6 +1062,13 @@ export class PumpState extends EqState {
     public set isActive(val: boolean) { this.setDataVal('isActive', val); }
     public get ppc(): number { return this.data.ppc; } // I think this is actually the filter % for vf and vsf.  Pump Pressure determines how much backpressure.
     public set ppc(val: number) { this.setDataVal('ppc', val); }
+    public get pumpError(): number { return typeof (this.data.pumpError) !== 'undefined' ? this.data.pumpError.val : 0; }
+    public set pumpError(val: number) {
+        if (this.pumpError !== val) {
+            this.data.pumpError = sys.board.valueMaps.pumpErrors.transform(val);
+            this.hasChanged = true;
+        }
+    }
     public get status(): number { return typeof (this.data.status) !== 'undefined' ? this.data.status.val : -1; }
     public set status(val: number) {
         // quick fix for #172
@@ -1053,6 +1138,7 @@ export class PumpState extends EqState {
                 case 'vssvrs':
                 case 'vs':
                 case 'regalmodbus':
+                case 'neptunemodbus':
                     c.units = sys.board.valueMaps.pumpUnits.transformByName('rpm');
                     break;
                 case 'ss':
@@ -1143,25 +1229,29 @@ export class ScheduleTime extends ChildEqState {
         try {
             let sod = ts.clone().startOfDay();
             let ysod = ts.clone().addHours(-24).startOfDay();
-            let nsod = ts.clone().addHours(-24).startOfDay();
+            let nsod = ts.clone().addHours(24).startOfDay();
             let ytimes: { startTime: Date, endTime: Date } = { startTime: null, endTime: null };  // Yesterday
             let ttimes: { startTime: Date, endTime: Date } = { startTime: null, endTime: null };  // Today
             let ntimes: { startTime: Date, endTime: Date } = { startTime: null, endTime: null };  // Tomorrow
             let tt = sys.board.valueMaps.scheduleTimeTypes.transform(sched.startTimeType);
             // Add the range for today and yesterday.
             switch (tt.name) {
-                case 'sunrise':
+                case 'sunrise': {
                     let sr = state.heliotrope.calcAdjustedTimes(sod.toDate(), 0, sched.startTimeOffset);
+                    if (!sr.isValid) return times;
                     ytimes.startTime = sr.prevSunrise;
                     ttimes.startTime = sr.sunrise;
                     ntimes.startTime = sr.nextSunrise;
                     break;
-                case 'sunset':
+                }
+                case 'sunset': {
                     let ss = state.heliotrope.calcAdjustedTimes(sod.toDate(), 0, sched.startTimeOffset);
+                    if (!ss.isValid) return times;
                     ytimes.startTime = ss.prevSunset;
                     ttimes.startTime = ss.sunset;
                     ntimes.startTime = ss.nextSunset;
                     break;
+                }
                 default:
                     ytimes.startTime = ysod.clone().addMinutes(sched.startTime).toDate();
                     ttimes.startTime = sod.clone().addMinutes(sched.startTime).toDate();
@@ -1170,21 +1260,22 @@ export class ScheduleTime extends ChildEqState {
             }
             tt = sys.board.valueMaps.scheduleTimeTypes.transform(sched.endTimeType);
             switch (tt.name) {
-                case 'sunrise':
+                case 'sunrise': {
                     let sr = state.heliotrope.calcAdjustedTimes(sod.toDate(), 0, sched.endTimeOffset);
-                    // If the start time of the previous window is greater than the previous sunrise then we use the sunrise for today.
+                    if (!sr.isValid) return times;
                     ytimes.endTime = ytimes.startTime >= sr.prevSunrise ? sr.sunrise : sr.prevSunrise;
-                    // If ths start time of the current window is greater than the current sunrise then we use the sunrise for tomorrow.
                     ttimes.endTime = ttimes.startTime >= sr.sunrise ? sr.nextSunrise : sr.sunrise;
                     ntimes.endTime = ntimes.startTime >= sr.nextSunrise ? new Timestamp(sr.nextSunrise).addHours(24).toDate() : sr.nextSunrise;
                     break;
-                case 'sunset':
+                }
+                case 'sunset': {
                     let ss = state.heliotrope.calcAdjustedTimes(sod.toDate(), 0, sched.endTimeOffset);
-                    // If the start time of the previous window is greater than the previous sunset then we use the sunset for today.
+                    if (!ss.isValid) return times;
                     ytimes.endTime = ytimes.startTime >= ss.prevSunset ? ss.sunset : ss.prevSunset;
                     ttimes.endTime = ttimes.startTime >= ss.sunset ? ss.nextSunset : ss.nextSunset;
                     ntimes.endTime = ntimes.startTime >= ss.nextSunset ? new Timestamp(ss.nextSunset).addHours(24).toDate() : ss.nextSunset;
                     break;
+                }
                 default:
                     ytimes.endTime = ysod.clone().addMinutes(sched.endTime).toDate();
                     if (ytimes.endTime <= ytimes.startTime) ytimes.endTime = ysod.clone().addHours(24).addMinutes(sched.endTime).toDate();
@@ -1225,7 +1316,7 @@ export class ScheduleTime extends ChildEqState {
                 let sd = schedDays.find(elem => elem.dow === ytimes.startTime.getDay());
                 if (typeof sd !== 'undefined' && (sched.scheduleDays & sd.bitval) !== 0) {
                     times.startTime = ytimes.startTime;
-                    times.endTime = ytimes.startTime;
+                    times.endTime = ytimes.endTime;
                     return times;
                 }
             }
@@ -1267,7 +1358,8 @@ export class ScheduleTime extends ChildEqState {
             let dtCalc = typeof this.calculatedDate !== 'undefined' && typeof this.calculatedDate.getTime === 'function' ? new Date(this.calculatedDate.getTime()).setHours(0, 0, 0, 0) : new Date(1970, 0, 1, 0, 0).getTime();
             let recalc = !this.calculated;
             if (!recalc && sod.getTime() !== dtCalc) recalc = true;
-            if (!recalc && (this.endTime && this.endTime.getTime() < new Date().getTime() && this.startTime && this.startTime.getTime() < dtCalc)) {
+            let schedType = sys.board.valueMaps.scheduleTypes.transform(sched.scheduleType);
+            if (!recalc && schedType.name !== 'runonce' && (this.endTime && this.endTime.getTime() < new Date().getTime() && this.startTime && this.startTime.getTime() < dtCalc)) {
                 recalc = true;
                 logger.info(`Recalculating expired schedule ${sched.id}`);
             }
@@ -1276,10 +1368,8 @@ export class ScheduleTime extends ChildEqState {
             this.calculatedDate = new Date(new Date().setHours(0, 0, 0, 0));
             if (sched.isActive === false || sched.disabled) return false;
             let tt = sys.board.valueMaps.scheduleTimeTypes.transform(sched.startTimeType);
-            // If this is a runonce schedule we need to check for the rundate
-            let type = sys.board.valueMaps.scheduleTypes.transform(sched.scheduleType);
-            let times = type.name === 'runonce' ? this.calcScheduleDate(new Timestamp(sched.startDate), sched) : this.calcScheduleDate(state.time.clone(), sched);
-            if (times.startTime && times.endTime.getTime() > currentTime.getTime()) {
+            let times = schedType.name === 'runonce' ? this.calcScheduleDate(new Timestamp(sched.startDate), sched) : this.calcScheduleDate(state.time.clone(), sched);
+            if (times.startTime && times.endTime && times.endTime.getTime() > currentTime.getTime()) {
                 // Check to see if it should be on.
                 this.startTime = times.startTime;
                 this.endTime = times.endTime;
@@ -1289,7 +1379,7 @@ export class ScheduleTime extends ChildEqState {
             else {
                 // Chances are that the current dow is not valid.  Fast forward until we get a day that works.  That will
                 // be the next scheduled run date.
-                if (type.name !== 'runonce' && sched.scheduleDays > 0) {
+                if (schedType.name !== 'runonce' && sched.scheduleDays > 0) {
                     let schedDays = sys.board.valueMaps.scheduleDays.toArray();
                     let day = sod.clone().addHours(24);
                     let dow = day.getDay();
@@ -1360,6 +1450,8 @@ export class ScheduleState extends EqState {
             this.hasChanged = true;
         }
     }
+    public get schedGroup(): number { return this.data.schedGroup || 0; }
+    public set schedGroup(val: number) { this.setDataVal('schedGroup', val); }
     public get startTimeType(): number { return typeof (this.data.startTimeType) !== 'undefined' ? this.data.startTimeType.val : -1; }
     public set startTimeType(val: number) {
         if (this.startTimeType !== val) {
@@ -1376,7 +1468,14 @@ export class ScheduleState extends EqState {
     }
     public get scheduleDays(): number { return typeof (this.data.scheduleDays) !== 'undefined' ? this.data.scheduleDays.val : undefined; }
     public set scheduleDays(val: number) {
-        if (this.scheduleDays !== val) {
+        // Run-once schedules always report scheduleDays=127 from the OCP regardless of
+        // actual day selection (days are irrelevant for run-once).  Normalize to 0 so the
+        // API does not expose a misleading wire value.  Use raw this.data access for both
+        // the type check and the equality check to avoid circular getter interactions.
+        const typeVal = typeof this.data.scheduleType !== 'undefined' ? (this.data.scheduleType.val ?? this.data.scheduleType) : undefined;
+        if (typeVal === sys.board.valueMaps.scheduleTypes.getValue('runonce')) val = 0;
+        const curVal = typeof this.data.scheduleDays !== 'undefined' ? this.data.scheduleDays.val : undefined;
+        if (curVal !== val) {
             this.data.scheduleDays = sys.board.valueMaps.scheduleDays.transform(val);
             this.hasChanged = true;
         }
@@ -1416,8 +1515,10 @@ export class ScheduleState extends EqState {
         //if (typeof this.circuit !== 'undefined')
         sched.circuit = state.circuits.getInterfaceById(this.circuit).get(true);
         sched.clockMode = sys.board.valueMaps.clockModes.transform(sys.general.options.clockMode) || {};
-        //let times = this.calcScheduleTimes(sched);
-        //sched.times = { shouldBeOn: times.shouldBeOn, startTime: times.shouldBeOn ? Timestamp.toISOLocal(times.startTime) : '', endTime: times.shouldBeOn ? Timestamp.toISOLocal(times.endTime) : '' };
+        if (typeof sched.schedGroup === 'undefined') {
+            let cfgSched = sys.schedules.getItemById(this.id, false);
+            sched.schedGroup = cfgSched ? cfgSched.schedGroup : 0;
+        }
         return sched;
     }
     public emitEquipmentChange() {
@@ -1548,6 +1649,8 @@ export class LightGroupStateCollection extends EqStateCollection<LightGroupState
             s.type = c.type;
             s.name = c.name;
             s.isActive = c.isActive;
+            s.action = 0;
+            s.endTime = undefined;
         }
 
     }
@@ -1717,6 +1820,8 @@ export class BodyTempState extends EqState {
     // indicator with Pentair OCPs.  This is triggered in NixieBoard and managed by the delayMgr.
     public get heaterCooldownDelay(): boolean { return this.data.heaterCooldownDelay; }
     public set heaterCooldownDelay(val: boolean) { this.setDataVal('heaterCooldownDelay', val); }
+    public get manualFreezeOverride(): boolean { return this.data.manualFreezeOverride || false; }
+    public set manualFreezeOverride(val: boolean) { this.setDataVal('manualFreezeOverride', val); }
     public emitData(name: string, data: any) { webApp.emitToClients('body', this.data); }
     // RKS: This is a very interesting object because we have a varied object.  Type safety rules should not apply
     // here as the heater types are specific to the installed equipment.  The reason is because it has no meaning without the body and the calculation of it should
@@ -1857,8 +1962,14 @@ export class HeaterState extends EqState {
     public set startupDelay(val: boolean) { this.setDataVal('startupDelay', val); }
     public get shutdownDelay(): boolean { return this.data.shutdownDelay; }
     public set shutdownDelay(val: boolean) { this.setDataVal('shutdownDelay', val); }
+    public get isActive(): boolean { return this.data.isActive; }
+    public set isActive(val: boolean) { this.setDataVal('isActive', val); }
     public get bodyId(): number { return this.data.bodyId || 0 }
     public set bodyId(val: number) { this.setDataVal('bodyId', val); }
+    public get gasValveHours(): number { return this.data.gasValveHours; }
+    public set gasValveHours(val: number) { this.setDataVal('gasValveHours', val); }
+    public get cycleCount(): number { return this.data.cycleCount; }
+    public set cycleCount(val: number) { this.setDataVal('cycleCount', val); }
 
 }
 export class FeatureStateCollection extends EqStateCollection<FeatureState> {
@@ -2036,6 +2147,11 @@ export class CircuitState extends EqState implements ICircuitState {
     }
     public get level(): number { return this.data.level; }
     public set level(val: number) { this.setDataVal('level', val); }
+    public get color(): { red: number; green: number; blue: number } { return this.data.color; }
+    public set color(val: { red: number; green: number; blue: number }) {
+        if (typeof val === 'undefined' || val === null) this.setDataVal('color', undefined);
+        else this.setDataVal('color', { red: val.red, green: val.green, blue: val.blue });
+    }
     public get commStatus(): number { return this.data.commStatus; }
     public set commStatus(val: number) {
         if (this.commStatus !== val) {
@@ -2148,6 +2264,18 @@ export class CoverState extends EqState {
     public set name(val: string) { this.setDataVal('name', val); }
     public get isClosed(): boolean { return this.data.isClosed; }
     public set isClosed(val: boolean) { this.setDataVal('isClosed', val); }
+    // Rule 18: mirror config fields that dashPanel renders on the Controllers/Covers tab so the
+    // UI doesn't lag between a config PUT and the next OCP rebroadcast.
+    public get isActive(): boolean { return this.data.isActive; }
+    public set isActive(val: boolean) { this.setDataVal('isActive', val); }
+    public get body(): number | any { return this.data.body; }
+    public set body(val: number | any) { this.setDataVal('body', sys.board.valueMaps.bodies.encode(val)); }
+    public get normallyOn(): boolean { return this.data.normallyOn; }
+    public set normallyOn(val: boolean) { this.setDataVal('normallyOn', val); }
+    public get chlorActive(): boolean { return this.data.chlorActive; }
+    public set chlorActive(val: boolean) { this.setDataVal('chlorActive', val); }
+    public get chlorOutput(): number { return this.data.chlorOutput; }
+    public set chlorOutput(val: number) { this.setDataVal('chlorOutput', val); }
 }
 export class ChlorinatorStateCollection extends EqStateCollection<ChlorinatorState> {
     public superChlor: { id: number, lastDispatch: number, reference: number }[] = [];

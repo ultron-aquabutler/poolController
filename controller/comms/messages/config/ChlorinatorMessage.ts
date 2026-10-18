@@ -15,16 +15,104 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-import { sys, Chlorinator } from "../../../Equipment";
+import { sys, Chlorinator, Cover } from "../../../Equipment";
 import { Inbound } from "../Messages";
 import { state } from "../../../State";
 import { logger } from "../../../../logger/Logger"
 export class ChlorinatorMessage {
+    // Ephemeral, session-only set of model strings we have already warned about.  See ChlorinatorStateMessage.
+    private static _loggedUnknownModels: Set<string> = new Set<string>();
     public static process(msg: Inbound): void {
         var chlorId;
         var chlor: Chlorinator;
         switch (msg.extractPayloadByte(1)) {
             case 0:
+                // ISSUE-078: IntelliCenter v3.008 changed the Action 30 cat=7 sub=0 payload from
+                // v1.x column-major (stride 4) to v3 row-major (4 slots × 9 bytes/slot, payload = 38 bytes).
+                // Validated slot offsets (2026-04-19):
+                //   [0]=body (raw OCP value — 32=poolspa/shared, 1=pool, 2=spa, and on this bench
+                //       also observed 0 for "Pool only" body assignment on a shared system; body
+                //       alone is NOT a reliable active-slot signal).
+                //   [1]=type
+                //   [2]=poolSetpoint (confirmed via OCP edit pool→19)
+                //   [3]=spaSetpoint  (confirmed via OCP edit spa→10)
+                //   [4]=?
+                //   [5]=superChlorHours (inactive-slot template = 96)
+                //   [6]=slot-active flag — 1=provisioned, 0=empty slot (parallels the v1.x
+                //       byte[i+22] active flag). Confirmed via packetLog(2026-04-19_23-14-52).log:
+                //       active slots stayed at 1 through both setpoint edits AND a body=32→0
+                //       "Pool only" toggle, while inactive slots 1..3 stay at 0.
+                //   [7..8]=unknown (possibly salt / status; Part C).
+                // superChlor on-flag location is NOT yet characterised on v3 — deferred.
+                if (sys.equipment.isIntellicenterV3) {
+                    const SLOT_STRIDE = 9;
+                    // ISSUE-075 #4 / ISSUE-080: the same packet carries the cover-menu "IntelliChlor
+                    // Output" at slot-0 offsets 7 (Pool, 0-50) and 8 (Spa, 0-10). Capture once here
+                    // and apply to whichever covers are bound to those bodies.
+                    let poolCoverOutput: number | undefined;
+                    let spaCoverOutput: number | undefined;
+                    for (let slot = 0; slot < 4; slot++) {
+                        const base = 2 + slot * SLOT_STRIDE;
+                        if (base + SLOT_STRIDE > msg.payload.length) break;
+                        const cid = slot + 1;
+                        const slotActive = msg.extractPayloadByte(base + 6) === 1;
+                        if (!slotActive) {
+                            sys.chlorinators.removeItemById(cid);
+                            state.chlorinators.removeItemById(cid);
+                            continue;
+                        }
+                        const c = sys.chlorinators.getItemById(cid, true);
+                        const sc = state.chlorinators.getItemById(c.id, true);
+                        c.isActive = sc.isActive = true;
+                        c.master = 0;
+                        c.body = msg.extractPayloadByte(base + 0);
+                        c.type = msg.extractPayloadByte(base + 1);
+                        if (!c.disabled && !c.isDosing) {
+                            c.poolSetpoint = msg.extractPayloadByte(base + 2);
+                            c.spaSetpoint = msg.extractPayloadByte(base + 3);
+                        }
+                        c.superChlorHours = msg.extractPayloadByte(base + 5);
+                        c.address = 80 + slot;
+                        if (typeof c.name === 'undefined' || c.name === '') c.name = `Chlorinator ${cid}`;
+                        sc.body = c.body;
+                        sc.poolSetpoint = c.poolSetpoint;
+                        sc.spaSetpoint = c.spaSetpoint;
+                        sc.type = c.type;
+                        sc.model = c.model;
+                        sc.name = c.name;
+                        sc.superChlorHours = c.superChlorHours;
+
+                        // Only slot 0 carries the cover-output bytes per current evidence. If a
+                        // multi-chlor install surfaces with populated bytes on other slots we can
+                        // widen this.
+                        if (slot === 0) {
+                            poolCoverOutput = msg.extractPayloadByte(base + 7);
+                            spaCoverOutput = msg.extractPayloadByte(base + 8);
+                        }
+                    }
+                    // Apply cover-menu IntelliChlor Output to covers (per-body routing).
+                    if (typeof poolCoverOutput !== 'undefined' || typeof spaCoverOutput !== 'undefined') {
+                        const poolBodyId = sys.board.valueMaps.bodies.getValue('pool');
+                        const spaBodyId = sys.board.valueMaps.bodies.getValue('spa');
+                        const covers = sys.covers.get();
+                        for (let i = 0; i < covers.length; i++) {
+                            const cov: Cover = sys.covers.getItemById(covers[i].id);
+                            if (!cov || !cov.isActive) continue;
+                            const scov = state.covers.getItemById(cov.id, true);
+                            const bodyVal = sys.board.valueMaps.bodies.encode(cov.body);
+                            if (bodyVal === poolBodyId && typeof poolCoverOutput !== 'undefined') {
+                                cov.chlorOutput = poolCoverOutput;
+                                scov.chlorOutput = poolCoverOutput;
+                            } else if (bodyVal === spaBodyId && typeof spaCoverOutput !== 'undefined') {
+                                cov.chlorOutput = spaCoverOutput;
+                                scov.chlorOutput = spaCoverOutput;
+                            }
+                        }
+                    }
+                    state.emitEquipmentChanges();
+                    msg.isProcessed = true;
+                    break;
+                }
                 chlorId = 1;
                 for (let i = 0; i < 4 && i + 30 < msg.payload.length; i++) {
                     let isActive = msg.extractPayloadByte(i + 22) === 1;
@@ -49,11 +137,16 @@ export class ChlorinatorMessage {
                         chlor.isActive = msg.extractPayloadByte(i + 22) === 1;
                         chlor.superChlorHours = msg.extractPayloadByte(i + 26);
                         chlor.address = 80 + i;
+                        // Set a default name if not already set (name comes from chlorinator's Action 3 response)
+                        if (typeof chlor.name === 'undefined' || chlor.name === '') {
+                            chlor.name = `Chlorinator ${chlorId}`;
+                        }
                         schlor.body = chlor.body;
                         schlor.poolSetpoint = chlor.poolSetpoint;
                         schlor.spaSetpoint = chlor.spaSetpoint;
                         schlor.type = chlor.type;
                         schlor.model = chlor.model;
+                        schlor.name = chlor.name;
                         schlor.isActive = chlor.isActive;
                         schlor.superChlorHours = chlor.superChlorHours;
                         state.emitEquipmentChanges();
@@ -96,6 +189,12 @@ export class ChlorinatorMessage {
                 chlor.model = sys.board.valueMaps.chlorinatorModel.getValue(schlor.name.toLowerCase());
                 if (typeof chlor.model === 'undefined') {
                     if (name.startsWith('iChlor')) chlor.model = sys.board.valueMaps.chlorinatorModel.getValue('ichlor-ic30');
+                }
+                // RG: 08-24-26 -- See ChlorinatorStateMessage case 3.  Log unrecognized model strings (eg the
+                // IntelliChlor Plus/LT series) instead of guessing at a mapping.  Logged once per distinct string.
+                if (typeof chlor.model === 'undefined' && !ChlorinatorMessage._loggedUnknownModels.has(schlor.name)) {
+                    ChlorinatorMessage._loggedUnknownModels.add(schlor.name);
+                    logger.info(`Unrecognized chlorinator model reported: '${schlor.name}'. Please report this string along with your cell model. ${msg.toPacket()}`);
                 }
             }
             if (typeof chlor.type === 'undefined') chlor.type = schlor.type = 0; 

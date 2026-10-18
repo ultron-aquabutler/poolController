@@ -20,6 +20,10 @@ import { sys } from "../../../Equipment";
 import { state } from "../../../State";
 import { ControllerType } from "../../../Constants";
 export class OptionsMessage {
+    private static decodeFreezeOverride(raw: number): number {
+        // v3.008 captures show this as a compact code where 0 => 30 min and 1 => 90 min.
+        return raw <= 3 ? (30 + (raw * 60)) : raw;
+    }
     public static process(msg: Inbound): void {
         switch (sys.controllerType) {
             case ControllerType.IntelliCenter:
@@ -55,8 +59,20 @@ export class OptionsMessage {
                             // cooldownDelay
                             //[255, 0, 255][165, 63, 15, 16, 30, 40][0, 0, 1, 129, 0, 0, 0, 0, 0, 0, 0, 0, 0, 176, 149, 29, 35, 3, 0, 0, 92, 81, 91, 81, 3, 3, 0, 0, 15, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0][4, 194]
                             sys.general.options.cooldownDelay = msg.extractPayloadByte(30) === 1;
-                            sys.general.options.manualPriority = msg.extractPayloadByte(38) === 1;
-                            sys.general.options.manualHeat = msg.extractPayloadByte(39) === 1;
+                            let manualPriorityByte = msg.extractPayloadByte(38, 255);
+                            const isIntellicenterV3 = (sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3);
+                            if (isIntellicenterV3) {
+                                const v3ManualPriorityByte = msg.extractPayloadByte(35, 255);
+                                if (v3ManualPriorityByte === 0 || v3ManualPriorityByte === 1) manualPriorityByte = v3ManualPriorityByte;
+                                const freezeCycleTime = msg.extractPayloadByte(25, 255);
+                                if (freezeCycleTime !== 255 && freezeCycleTime >= 1 && freezeCycleTime <= 60) {
+                                    sys.general.options.freezeCycleTime = freezeCycleTime;
+                                    sys.general.options.valveDelay = msg.extractPayloadByte(26) > 0;
+                                    sys.general.options.cooldownDelay = msg.extractPayloadByte(27) === 1;
+                                }
+                            }
+                            if (manualPriorityByte !== 255) sys.general.options.manualPriority = manualPriorityByte === 1;
+                            sys.general.options.manualHeat = msg.extractPayloadByte(isIntellicenterV3 ? 36 : 39) === 1;
                             let fnTranslateByte = (byte):number => { return (byte & 0x007F) * (((byte & 0x0080) > 0) ? -1 : 1); }
                             sys.equipment.tempSensors.setCalibration('water1', fnTranslateByte(msg.extractPayloadByte(3)));
                             sys.equipment.tempSensors.setCalibration('solar1', fnTranslateByte(msg.extractPayloadByte(4)));
@@ -75,17 +91,45 @@ export class OptionsMessage {
                             //sys.general.options.airTempAdj = (msg.extractPayloadByte(5) & 0x007F) * (((msg.extractPayloadByte(5) & 0x0080) > 0) ? -1 : 1);
                             //sys.general.options.waterTempAdj2 = (msg.extractPayloadByte(6) & 0x007F) * (((msg.extractPayloadByte(6) & 0x0080) > 0) ? -1 : 1);
 
-                            // Somewhere in here are the units.
+                            const unitsRaw = msg.extractPayloadByte(isIntellicenterV3 ? 31 : 32, 255);
+                            if (unitsRaw === 0 || unitsRaw === 1) {
+                                const mappedUnits = unitsRaw === 1
+                                    ? sys.board.valueMaps.tempUnits.getValue('C')
+                                    : sys.board.valueMaps.tempUnits.getValue('F');
+                                sys.general.options.units = mappedUnits;
+                                state.temps.units = mappedUnits;
+                                const bodyUnits = mappedUnits === sys.board.valueMaps.tempUnits.getValue('C') ? 2 : 1;
+                                for (let i = 0; i < sys.bodies.length; i++) sys.bodies.getItemByIndex(i).capacityUnits = bodyUnits;
+                            }
+
+                            // v3.004+: payload layout shifted by 1 byte vs v1.x (timestamp insertion earlier in the packet).
+                            // Evidence: replay.21 Action 30 type 0 has [.., 85,100,94,103, 3,3 ..] at bytes 19-24.
+                            const poolHeatNdx = isIntellicenterV3 ? 19 : 20;
+                            const poolCoolNdx = isIntellicenterV3 ? 20 : 21;
+                            const spaHeatNdx = isIntellicenterV3 ? 21 : 22;
+                            const spaCoolNdx = isIntellicenterV3 ? 22 : 23;
+                            const poolModeNdx = isIntellicenterV3 ? 23 : 24;
+                            const spaModeNdx = isIntellicenterV3 ? 24 : 25;
 
                             let body = sys.bodies.getItemById(1, sys.equipment.maxBodies > 0);
-                            body.heatMode = msg.extractPayloadByte(24);
-                            body.heatSetpoint = msg.extractPayloadByte(20);
-                            body.coolSetpoint = msg.extractPayloadByte(21);
+                            body.heatMode = msg.extractPayloadByte(poolModeNdx);
+                            body.heatSetpoint = msg.extractPayloadByte(poolHeatNdx);
+                            body.coolSetpoint = msg.extractPayloadByte(poolCoolNdx);
+                            // Keep runtime state in sync with config values so UIs (dashPanel/MQTT/etc) reflect
+                            // authoritative OCP updates, including changes initiated by other panels (Wireless/OP).
+                            let sbody = state.temps.bodies.getItemById(1, true);
+                            sbody.heatMode = body.heatMode;
+                            sbody.heatSetpoint = body.heatSetpoint;
+                            sbody.coolSetpoint = body.coolSetpoint;
 
                             body = sys.bodies.getItemById(2, sys.equipment.maxBodies > 1);
-                            body.heatMode = msg.extractPayloadByte(25);
-                            body.heatSetpoint = msg.extractPayloadByte(22);
-                            body.coolSetpoint = msg.extractPayloadByte(23);
+                            body.heatMode = msg.extractPayloadByte(spaModeNdx);
+                            body.heatSetpoint = msg.extractPayloadByte(spaHeatNdx);
+                            body.coolSetpoint = msg.extractPayloadByte(spaCoolNdx);
+                            sbody = state.temps.bodies.getItemById(2, true);
+                            sbody.heatMode = body.heatMode;
+                            sbody.heatSetpoint = body.heatSetpoint;
+                            sbody.coolSetpoint = body.coolSetpoint;
 
                             //body = sys.bodies.getItemById(3, sys.equipment.maxBodies > 2);
                             //body.heatMode = msg.extractPayloadByte(26);
@@ -108,6 +152,8 @@ export class OptionsMessage {
                         sys.general.options.vacation.endDate = new Date(yy, mm - 1, dd);
                         sys.general.options.vacation.enabled = msg.extractPayloadByte(2) > 0;
                         sys.general.options.vacation.useTimeframe = msg.extractPayloadByte(3) > 0;
+                        sys.general.options.showBadgeColors = msg.extractPayloadByte(12) === 1;
+                        sys.general.options.solarAsHeatPump = msg.extractPayloadByte(14) === 1;
                         msg.isProcessed = true;
                         break;
                 }
