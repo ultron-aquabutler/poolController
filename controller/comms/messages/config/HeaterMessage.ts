@@ -360,6 +360,8 @@ export class HeaterMessage {
     private static processCooldownDelay(msg: Inbound) {
         for (let i = 0; i < msg.payload.length - 1 && i <= sys.equipment.maxHeaters - 1; i++) {
             var heater: Heater = sys.heaters.getItemById(i + 1);
+            const htype = sys.board.valueMaps.heaterTypes.transform(heater.type);
+            if (htype.name === 'heatpump') continue;
             heater.cooldownDelay = msg.extractPayloadByte(i + 2);
             // heater.isVirtual = false;
             if (heater.master === 1) {
@@ -395,6 +397,8 @@ export class HeaterMessage {
             else {
                 heater.isActive = heater.type > 0;
                 heater.body = msg.extractPayloadByte(i + 17);
+                const htype = sys.board.valueMaps.heaterTypes.transform(heater.type);
+                if (htype.name === 'heatpump') heater.cooldownDelay = undefined;
                 // heater.isVirtual = false;
                 if (heater.master === 1) {
                     heater.master = 0;
@@ -424,18 +428,22 @@ export class HeaterMessage {
         msg.isProcessed = true;
     }
     private static processStartStopDelta(msg: Inbound) {
+        const isV3 = sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3;
+        const stopOffset = isV3 ? 17 : 18;
         for (let i = 1; i < msg.payload.length - 1 && i <= sys.equipment.maxHeaters; i++) {
             var heater: Heater = sys.heaters.getItemById(i);
             heater.startTempDelta = msg.extractPayloadByte(i + 1);
-            heater.stopTempDelta = msg.extractPayloadByte(i + 18);
+            heater.stopTempDelta = msg.extractPayloadByte(i + stopOffset);
         }
         msg.isProcessed = true;
     }
     private static processCoolingSetTemp(msg: Inbound) {
+        const isV3 = sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3;
+        const diffOffset = isV3 ? 17 : 18;
         for (let i = 1; i < msg.payload.length - 1 && i <= sys.equipment.maxHeaters; i++) {
             var heater: Heater = sys.heaters.getItemById(i);
             heater.coolingEnabled = msg.extractPayloadByte(i + 1) > 0;
-            heater.differentialTemp = msg.extractPayloadByte(i + 18);
+            heater.differentialTemp = msg.extractPayloadByte(i + diffOffset);
         }
         msg.isProcessed = true;
     }

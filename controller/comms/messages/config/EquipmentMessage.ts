@@ -27,7 +27,15 @@ export class EquipmentMessage {
         let body: Body;
         let sbody: BodyTempState;
         switch (sys.controllerType) {
-            case ControllerType.IntelliCenter:
+            case ControllerType.IntelliCenter: {
+                // v3.004+ encodes body capacity as a 16-bit big-endian value (×1000 gal) at [hi, lo].
+                // v1.x encodes it as a single byte (×1000 gal). See ISSUE-073.
+                const isIntellicenterV3 = sys.equipment.isIntellicenterV3 === true;
+                const readCapacity = (hiIdx: number, loIdx: number): number => {
+                    const hi = msg.extractPayloadByte(hiIdx, 0);
+                    const lo = msg.extractPayloadByte(loIdx, 0);
+                    return (isIntellicenterV3 ? ((hi << 8) | lo) : hi) * 1000;
+                };
                 switch (msg.extractPayloadByte(1)) {
                     case 0:
                         sys.equipment.name = msg.extractPayloadString(2, 16);
@@ -46,7 +54,7 @@ export class EquipmentMessage {
                         body = sys.bodies.getItemById(1, sys.equipment.maxBodies >= 1);
                         sbody = state.temps.bodies.getItemById(1, sys.equipment.maxBodies >= 1);
                         sbody.type = body.type = msg.extractPayloadByte(39);
-                        body.capacity = msg.extractPayloadByte(34) * 1000;
+                        body.capacity = readCapacity(34, 35);
                         if (body.isActive && sys.equipment.maxBodies === 0) sys.bodies.removeItemById(1);
                         body.isActive = sys.equipment.maxBodies > 0;
                         msg.isProcessed = true;
@@ -59,7 +67,7 @@ export class EquipmentMessage {
                             body = sys.bodies.getItemById(bodyId, true);
                             sbody = state.temps.bodies.getItemById(bodyId, true);
                             sbody.type = body.type = msg.extractPayloadByte(35);
-                            body.capacity = msg.extractPayloadByte(34) * 1000;
+                            body.capacity = readCapacity(34, 35);
                             body.isActive = true;
                         }
                         else {
@@ -76,19 +84,22 @@ export class EquipmentMessage {
                         body = sys.bodies.getItemById(bodyId, bodyId <= sys.equipment.maxBodies);
                         sbody = state.temps.bodies.getItemById(bodyId, bodyId <= sys.equipment.maxBodies);
                         sbody.name = body.name = msg.extractPayloadString(2, 16);
-                        bodyId = 3;
-                        if (sys.equipment.maxBodies >= bodyId) {
-                            body = sys.bodies.getItemById(bodyId, bodyId <= sys.equipment.maxBodies);
-                            sbody = state.temps.bodies.getItemById(bodyId, bodyId <= sys.equipment.maxBodies);
-                            sbody.type = body.type = msg.extractPayloadByte(35);
-                            body.capacity = msg.extractPayloadByte(34) * 1000;
-                            body.isActive = bodyId <= sys.equipment.maxBodies;
+                        // IntelliCenter shared-body systems (e.g. i10PS) have Pool+Spa (Body1+Body2). In those systems,
+                        // the second string in this packet is Body2 (Spa). Non-shared multi-body systems keep the legacy mapping.
+                        const secondBodyId = (sys.equipment.shared === true && sys.equipment.dual !== true) ? 2 : 3;
+                        if (sys.equipment.maxBodies >= secondBodyId) {
+                            body = sys.bodies.getItemById(secondBodyId, secondBodyId <= sys.equipment.maxBodies);
+                            sbody = state.temps.bodies.getItemById(secondBodyId, secondBodyId <= sys.equipment.maxBodies);
+                            // Only body3+ packets include type/capacity bytes here; avoid corrupting 2-body systems.
+                            if (secondBodyId >= 3) {
+                                sbody.type = body.type = msg.extractPayloadByte(35);
+                                body.capacity = readCapacity(34, 35);
+                            }
+                            body.isActive = secondBodyId <= sys.equipment.maxBodies;
                             sbody.name = body.name = msg.extractPayloadString(18, 16);
-                            body.isActive = bodyId <= sys.equipment.maxBodies;
-                        }
-                        else {
-                            sys.bodies.removeItemById(bodyId);
-                            state.temps.bodies.removeItemById(bodyId);
+                        } else {
+                            sys.bodies.removeItemById(secondBodyId);
+                            state.temps.bodies.removeItemById(secondBodyId);
                         }
                         msg.isProcessed = true;
                         break;
@@ -99,7 +110,16 @@ export class EquipmentMessage {
                         if (sys.equipment.maxBodies >= bodyId) {
                             body = sys.bodies.getItemById(bodyId, bodyId <= sys.equipment.maxBodies);
                             sbody = state.temps.bodies.getItemById(bodyId, bodyId <= sys.equipment.maxBodies);
-                            sbody.name = body.name = msg.extractPayloadString(2, 16);
+                            const firstName = msg.extractPayloadString(2, 16);
+                            const secondName = msg.extractPayloadString(18, 16);
+                            if (sys.equipment.shared === true && sys.equipment.dual !== true) {
+                                // Shared-body systems often carry placeholder names in case 3 (for body 3/4 slots).
+                                // Do not overwrite a valid Spa name with "UNCONFIGURED".
+                                const resolvedName = EquipmentMessage.resolveSharedBody2Name(firstName, secondName, body.name);
+                                if (typeof resolvedName !== 'undefined') sbody.name = body.name = resolvedName;
+                            } else {
+                                sbody.name = body.name = firstName;
+                            }
                         }
                         else {
                             sys.bodies.removeItemById(bodyId);
@@ -111,7 +131,7 @@ export class EquipmentMessage {
                             sbody = state.temps.bodies.getItemById(bodyId, bodyId <= sys.equipment.maxBodies);
                             sbody.name = body.name = msg.extractPayloadString(18, 16);
                             sbody.type = body.type = msg.extractPayloadByte(37);
-                            body.capacity = msg.extractPayloadByte(36) * 1000;
+                            body.capacity = readCapacity(36, 37);
                             if (body.isActive && bodyId > sys.equipment.maxBodies) sys.bodies.removeItemById(bodyId);
                             body.isActive = bodyId <= sys.equipment.maxBodies;
                         }
@@ -124,7 +144,7 @@ export class EquipmentMessage {
                             body = sys.bodies.getItemById(bodyId, bodyId <= sys.equipment.maxBodies);
                             sbody = state.temps.bodies.getItemById(bodyId, bodyId <= sys.equipment.maxBodies);
                             sbody.type = body.type = msg.extractPayloadByte(35);
-                            body.capacity = msg.extractPayloadByte(34) * 1000;
+                            body.capacity = readCapacity(34, 35);
                             if (body.isActive && bodyId > sys.equipment.maxBodies) sys.bodies.removeItemById(bodyId);
                             body.isActive = bodyId <= sys.equipment.maxBodies;
                         }
@@ -144,11 +164,48 @@ export class EquipmentMessage {
                         state.equipment.maxPumps = sys.equipment.maxPumps;
                         msg.isProcessed = true;
                         break;
+                    case 12:
+                    case 13:
+                    case 14:
+                    case 15:
+                    case 16:
+                    case 17:
+                    case 18: {
+                        const selector = msg.extractPayloadByte(1);
+                        const raw = EquipmentMessage.extractAlertRaw(msg);
+                        sys.alerts.setRaw(selector, raw);
+                        switch (selector) {
+                            case 12:
+                                sys.alerts.circuitNotifications = raw.length > 0 ? raw[0] : 0;
+                                break;
+                            case 13:
+                                sys.alerts.pumpNotifications = EquipmentMessage.extractAlertMask(raw);
+                                break;
+                            case 14:
+                                sys.alerts.ultratempNotifications = EquipmentMessage.extractAlertMask(raw);
+                                break;
+                            case 15:
+                                sys.alerts.chlorinatorNotifications = EquipmentMessage.extractAlertMask(raw);
+                                break;
+                            case 16:
+                                sys.alerts.intellichemNotifications = EquipmentMessage.extractAlertMask(raw);
+                                break;
+                            case 17:
+                                sys.alerts.hybridNotifications = EquipmentMessage.extractAlertMask(raw);
+                                break;
+                            case 18:
+                                sys.alerts.connectedGasNotifications = EquipmentMessage.extractAlertMask(raw);
+                                break;
+                        }
+                        msg.isProcessed = true;
+                        break;
+                    }
                     default:
                         logger.debug(`Unprocessed Config Message ${msg.toPacket()}`)
                         break;
                 }
                 break;
+            }
             case ControllerType.IntelliCom:
             case ControllerType.EasyTouch:
             case ControllerType.IntelliTouch:
@@ -166,6 +223,35 @@ export class EquipmentMessage {
         // [165,33,15,16,252,17],0,{2,90},0,0,{1,10},0,0,0,0,0,0,0,0,0,0],[2,89]
         sys.equipment.bootloaderVersion = `${msg.extractPayloadByte(5)}.${msg.extractPayloadByte(6) < 100 ? '0' + msg.extractPayloadByte(6) : msg.extractPayloadByte(6)}`;
         sys.equipment.controllerFirmware = `${msg.extractPayloadByte(1)}.${msg.extractPayloadByte(2) < 100 ? '0' + msg.extractPayloadByte(2) : msg.extractPayloadByte(2)}`;
+    }
+    private static extractAlertRaw(msg: Inbound): number[] {
+        const raw: number[] = [];
+        for (let i = 2; i < msg.payload.length; i++) raw.push(msg.extractPayloadByte(i, 0));
+        return raw;
+    }
+    private static extractAlertMask(raw: number[]): number {
+        if (raw.length === 0) return 0;
+        let mask = 0;
+        if (raw.length <= 2) {
+            for (let i = 0; i < raw.length; i++) {
+                mask = (mask << 8) | (raw[i] & 0xFF);
+            }
+        } else {
+            for (let i = 0; i < raw.length; i++) {
+                mask |= (raw[i] & 0xFF) << (i * 8);
+            }
+        }
+        return mask >>> 0;
+    }
+    private static isPlaceholderBodyName(name: string): boolean {
+        const normalized = (name || '').replace(/\u0000/g, '').trim().toUpperCase();
+        return normalized.length === 0 || normalized === 'UNCONFIGURED';
+    }
+    private static resolveSharedBody2Name(firstName: string, secondName: string, currentName: string): string | undefined {
+        if (!EquipmentMessage.isPlaceholderBodyName(secondName)) return secondName;
+        if (!EquipmentMessage.isPlaceholderBodyName(firstName)) return firstName;
+        if (EquipmentMessage.isPlaceholderBodyName(currentName)) return secondName;
+        return undefined;
     }
     //private static calcModel(eq: Equipment) {
     //    eq.shared = (eq.type & 8) === 8;

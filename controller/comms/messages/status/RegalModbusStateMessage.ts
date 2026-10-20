@@ -72,10 +72,25 @@ export class RegalModbusStateMessage {
         let ack = msg.header[2];
 
         if (ack == 0x20) return;
+
+        // Handle NACK responses
         if (ack in nackErrors) {
+            // NACK on Go/Stop indicates pump fault for those control commands
+            if (functionCode === 0x41 || functionCode === 0x42) {
+                let pumpCfg = sys.pumps.getPumpByAddress(addr, false, { isActive: false });
+                let pumpId = pumpCfg.id;
+                let pumpState = state.pumps.getItemById(pumpId, pumpCfg.isActive === true);
+                let commandName = functionCode === 0x41 ? 'Go' : 'Stop';
+                let faultDesc = nackErrors[ack];
+                logger.error(`RegalModbusStateMessage: Pump ${pumpCfg.name} (addr ${addr}) returned NACK to ${commandName} command - ${faultDesc}`);
+                pumpState.driveState = 4;
+                pumpState.command = 4;
+                return;
+            }
             logger.debug(`RegalModbusStateMessage.process NACK: ${nackErrors[ack]} (Address: ${addr})`);
             return;
         }
+
         if (ack != 0x10) {
             logger.debug(`RegalModbusStateMessage.process Unknown ACK: ${ack} (Address: ${addr})`);
             return;

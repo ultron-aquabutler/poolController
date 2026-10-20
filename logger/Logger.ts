@@ -32,7 +32,7 @@ class Logger {
         if (!fs.existsSync(path.join(process.cwd(), '/logs'))) fs.mkdirSync(path.join(process.cwd(), '/logs'));
         this.pktPath = path.join(process.cwd(), '/logs', this.getPacketPath());
         this.captureForReplayBaseDir = path.join(process.cwd(), '/logs/', this.getLogTimestamp());
-        /*         this.captureForReplayPath = path.join(this.captureForReplayBaseDir, '/packetCapture.json'); */
+        this.captureForReplayPath = this.captureForReplayBaseDir;
         this.pkts = [];
         this.slMessages = [];
     }
@@ -48,6 +48,8 @@ class Logger {
     private captureForReplayPath: string;
     private pktTimer: NodeJS.Timeout;
     private currentTimestamp: string;
+    private _captureInProgress: boolean = false;
+    public get captureInProgress(): boolean { return this._captureInProgress; }
     private getPacketPath(): string {
         // changed this to remove spaces from the name
         return 'packetLog(' + this.getLogTimestamp() + ').log';
@@ -75,7 +77,10 @@ class Logger {
             transports: [this.transports.console]
         });
         this.transports.console.level = this.cfg.app.level;
-        if (this.cfg.app.captureForReplay) this.startCaptureForReplay(false);
+        // Only start capture if not already capturing (prevents duplicate transports when config watcher triggers init())
+        if (this.cfg.app.captureForReplay && !this._captureInProgress) {
+            this.startCaptureForReplay(false);
+        }
         if (this.cfg.app.logToFile) {
             this.transports.consoleFile = new winston.transports.File({
                 filename: path.join(process.cwd(), '/logs', this.getConsoleToFilePath()),
@@ -125,13 +130,17 @@ class Logger {
         return false;
     }
     public packet(msg: Message) {
+        // Emits to clients should not be gated by logging settings.
+        // Logging-to-file/console remains gated by packet config and filters.
+        webApp.emitToChannel('msgLogger', 'logMessage', msg);
+
+        // Filter out the messages we do not want to *log*.
+        let bLog: boolean = true;
         if (logger.cfg.packet.enabled || logger.cfg.app.captureForReplay) {
-            // Filter out the messages we do not want.
-            var bLog: boolean = true;
             // A random packet may actually find its way into the throws should the bytes get messed up
             // in a fashion where the header byte is 255, 0, 255 but we have not identified the channel.
             // Thus far we have seen 165 and 166.
-            var cfgPacket = logger.cfg.packet[msg.protocol] || logger.cfg.packet['unidentified'];
+            const cfgPacket = logger.cfg.packet[msg.protocol] || logger.cfg.packet['unidentified'];
             if (!logger.cfg.app.captureForReplay) {
                 // Log invalid messages no matter what if the user has selected invalid message logging.
                 if (bLog && !msg.isValid) {
@@ -147,24 +156,25 @@ class Logger {
                     if (bLog && logger.isExcluded(msg.action, cfgPacket.excludeActions)) bLog = false;
                 }
             }
-            
-            if (bLog) {
-                if (logger.cfg.packet.logToFile) {
-                    logger.pkts.push(msg);
-                    if (logger.pkts.length > 5)
-                        logger.flushLogs();
-                    else {
-                        // Attempt to ease up on the writes if we are logging a bunch of packets.
-                        if (logger.pktTimer) clearTimeout(logger.pktTimer);
-                        logger.pktTimer = setTimeout(logger.flushLogs, 1000);
-                    }
+
+            if (bLog && logger.cfg.packet.logToFile) {
+                logger.pkts.push(msg);
+                if (logger.pkts.length > 5)
+                    logger.flushLogs();
+                else {
+                    // Attempt to ease up on the writes if we are logging a bunch of packets.
+                    if (logger.pktTimer) clearTimeout(logger.pktTimer);
+                    logger.pktTimer = setTimeout(logger.flushLogs, 1000);
                 }
-                webApp.emitToChannel('msgLogger', 'logMessage', msg);
             }
         }
-        if (logger.cfg.packet.logToConsole) {
-            if (msg.isValid && bLog) logger._logger.info(msg.toLog());
-            else if (!msg.isValid) logger._logger.warn(msg.toLog());
+        else {
+            bLog = false;
+        }
+
+        if (logger.cfg.packet.logToConsole && bLog) {
+            if (msg.isValid) logger._logger.info(msg.toLog());
+            else logger._logger.warn(msg.toLog());
         }
     }
     public screenlogic(data: any){
@@ -266,10 +276,11 @@ class Logger {
         }
     }
     public startCaptureForReplay(bResetLogs:boolean) {
+        this._captureInProgress = true;
         logger.info(`Starting Replay Capture.`);
         // start new replay directory
 
-        if (!fs.existsSync(this.captureForReplayPath)) fs.mkdirSync(this.captureForReplayBaseDir, { recursive: true });
+        if (!fs.existsSync(this.captureForReplayBaseDir)) fs.mkdirSync(this.captureForReplayBaseDir, { recursive: true });
         
         // Create logs subdirectory for additional log files
         let logsSubDir = path.join(this.captureForReplayBaseDir, 'logs');
@@ -365,72 +376,84 @@ class Logger {
         this.transports.console.level = 'silly';
     }
     public async stopCaptureForReplayAsync(remLogs?: any[]):Promise<string> {
-        return new Promise<string>(async (resolve, reject) => {
-            try {
-                // Get REM server configurations from config
-                let configData = config.getSection();
-                let remServers = [];
-                if (configData.web && configData.web.interfaces) {
-                    for (let interfaceName in configData.web.interfaces) {
-                        let interfaceConfig = configData.web.interfaces[interfaceName];
-                        if (interfaceConfig.type === 'rem' && interfaceConfig.enabled) {
-                            remServers.push({
-                                name: interfaceConfig.name || interfaceName,
-                                uuid: interfaceConfig.uuid,
-                                host: interfaceConfig.options?.host || '',
-                                backup: true
-                            });
-                        }
+        try {
+            if (!this._captureInProgress) {
+                logger.warn(`stopCaptureForReplayAsync called with no active capture session; creating backup without capture logs`);
+            }
+            // Get REM server configurations from config
+            let configData = config.getSection();
+            let remServers = [];
+            if (configData.web && configData.web.interfaces) {
+                for (let interfaceName in configData.web.interfaces) {
+                    let interfaceConfig = configData.web.interfaces[interfaceName];
+                    if (interfaceConfig.type === 'rem' && interfaceConfig.enabled) {
+                        remServers.push({
+                            name: interfaceConfig.name || interfaceName,
+                            uuid: interfaceConfig.uuid,
+                            host: interfaceConfig.options?.host || '',
+                            backup: true
+                        });
                     }
                 }
+            }
 
-                // Use the existing backup logic to create the base backup
-                let backupOptions = {
-                    njsPC: true,
-                    servers: remServers,
-                    name: `Packet Capture ${this.currentTimestamp}`,
-                    automatic: false
-                };
-                
-                let backupFile = await webApp.backupServer(backupOptions);
-                
-                // Add packet capture logs to the existing backup zip
-                let jszip = require("jszip");
-                let zip = await jszip.loadAsync(fs.readFileSync(backupFile.filePath));
-                
-                // Add packet capture logs to the njsPC/logs directory
-                zip.file(`njsPC/logs/${this.getPacketPath()}`, fs.readFileSync(logger.pktPath));
-                zip.file(`njsPC/logs/${this.getConsoleToFilePath()}`, fs.readFileSync(this.consoleToFilePath));
-                
-                // Add REM server logs if provided
-                if (remLogs && remLogs.length > 0) {
-                    logger.info(`Adding ${remLogs.length} REM logs to backup`);
-                    for (let remLog of remLogs) {
-                        // Create logs directory for the REM server using the hardcoded name
-                        let logPath = `Relay Equipment Manager/logs/${remLog.logFileName}`;
-                        logger.info(`Adding REM log to backup: ${logPath} (size: ${remLog.logData.length} characters)`);
-                        zip.file(logPath, remLog.logData);
-                    }
-                } else {
-                    logger.info(`No REM logs provided to add to backup`);
+            // Use the existing backup logic to create the base backup.
+            const ts = this.currentTimestamp || this.getLogTimestamp();
+            let backupOptions = {
+                njsPC: true,
+                servers: remServers,
+                name: `Packet Capture ${ts}`,
+                automatic: false
+            };
+            let backupFile = await webApp.backupServer(backupOptions);
+            // Add packet capture logs to the existing backup zip
+            let jszip = require("jszip");
+            let zip = await jszip.loadAsync(fs.readFileSync(backupFile.filePath));
+
+            // Add packet capture logs to the njsPC/logs directory if present.
+            if (typeof logger.pktPath === 'string' && logger.pktPath.length > 0 && fs.existsSync(logger.pktPath)) {
+                zip.file(`njsPC/logs/${path.basename(logger.pktPath)}`, fs.readFileSync(logger.pktPath));
+            } else {
+                logger.warn(`Packet capture log file unavailable during stopCaptureForReplayAsync; skipping packet log attachment`);
+            }
+            if (typeof this.consoleToFilePath === 'string' && this.consoleToFilePath.length > 0 && fs.existsSync(this.consoleToFilePath)) {
+                zip.file(`njsPC/logs/${path.basename(this.consoleToFilePath)}`, fs.readFileSync(this.consoleToFilePath));
+            } else {
+                logger.warn(`Console capture log file unavailable during stopCaptureForReplayAsync; skipping console log attachment`);
+            }
+
+            // Add REM server logs if provided.
+            if (remLogs && remLogs.length > 0) {
+                logger.info(`Adding ${remLogs.length} REM logs to backup`);
+                for (let remLog of remLogs) {
+                    // Create logs directory for the REM server using the hardcoded name.
+                    let logPath = `Relay Equipment Manager/logs/${remLog.logFileName}`;
+                    logger.info(`Adding REM log to backup: ${logPath} (size: ${remLog.logData.length} characters)`);
+                    zip.file(logPath, remLog.logData);
                 }
-                
-                // Generate the updated zip
-                await zip.generateAsync({type:'nodebuffer'}).then(content => {
-                    fs.writeFileSync(backupFile.filePath, content);
-                });
-                
-                // Restore original logging configuration
-                this.cfg = config.getSection('log');
+            } else {
+                logger.info(`No REM logs provided to add to backup`);
+            }
+
+            // Generate the updated zip.
+            await zip.generateAsync({ type: 'nodebuffer' }).then(content => {
+                fs.writeFileSync(backupFile.filePath, content);
+            });
+            // Restore original logging configuration.
+            this.cfg = config.getSection('log');
+            if (typeof this.transports.file !== 'undefined') {
                 logger._logger.remove(this.transports.file);
-                this.transports.console.level = this.cfg.app.level;
-                
-                resolve(backupFile.filePath);
+                this.transports.file.close();
+                this.transports.file = undefined;
             }
-            catch (err) {
-                reject(err.message);
-            }
-        });
+            this.transports.console.level = this.cfg.app.level;
+            this._captureInProgress = false;
+            return backupFile.filePath;
+        }
+        catch (err) {
+            this._captureInProgress = false;
+            return Promise.reject(err instanceof Error ? err.message : `${err}`);
+        }
     }
 }
 export var logger = new Logger();

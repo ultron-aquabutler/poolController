@@ -25,9 +25,10 @@ import { ControllerType } from '../../../Constants';
 import { Body, Circuit, ExpansionPanel, Feature, Heater, sys } from '../../../Equipment';
 import { BodyTempState, ScheduleState, State, state } from '../../../State';
 import { ExternalMessage } from '../config/ExternalMessage';
-import { Inbound, Message } from '../Messages';
+import { Inbound, Message, Outbound } from '../Messages';
 
 export class EquipmentStateMessage {
+    private static _superChlorOffCount: number = 0;
     private static initIntelliCenter(msg: Inbound) {
         sys.controllerType = ControllerType.IntelliCenter;
         sys.equipment.maxSchedules = 100;
@@ -83,29 +84,43 @@ export class EquipmentStateMessage {
                 logger.error(`Unknown Touch Controller ${msg.extractPayloadByte(28)}:${msg.extractPayloadByte(27)}`);
                 break;
         }
-        //let board = sys.board as EasyTouchBoard;
-        //board.initExpansionModules(model1, model2);
     }
     private static initController(msg: Inbound) {
-        state.status = 1;
         const model1 = msg.extractPayloadByte(27);
         const model2 = msg.extractPayloadByte(28);
         // RKS: 06-15-20 -- While this works for now the way we are detecting seems a bit dubious.  First, the 2 status message
         // contains two model bytes.  Right now the ones witness in the wild include 23 = fw1.023, 40 = fw1.040, 47 = fw1.047.
         // RKS: 07-21-22 -- Pentair is about to release fw1.232.  Unfortunately, the byte mapping for this has changed such that
-        // the bytes [27,28] are [0,2] respectively.  This looks like it might be in conflict with IntelliTouch but it is not.  Below
-        // are the combinations of 27,28 we have seen for IntelliTouch
+        // the bytes [27,28] are [0,2] respectively.  This IS in conflict with IntelliTouch i9+3 (also [0,2]).
+        // We disambiguate via header[1]: IntelliCenter uses 1, Touch systems use other values (e.g. 18).
+        // Below are the combinations of 27,28 we have seen for IntelliTouch
+        // [0,2] = i9+3 (Rev B, part 520074) -- header[1] != 1 distinguishes from IntelliCenter
         // [1,0] = i5+3
         // [0,1] = i7+3
         // [1,3] = i5+3s
         // [1,4] = i9+3s
         // [1,5] = i10+3d
+        // IntelliCenter v3.x reports model1=3 with model2 carrying the panel/expansion variant
+        // (same convention IntelliTouch used for the `[1, N]` family above).  Observed so far:
+        //   [3, 1] = v3.x i5P personality (Discussion #1223 / ISSUE-001)
+        //   [3, 2] = v3.004+ i8PS / i10PS personality card only
+        //   [3, 3] = v3.008 i10D personality card + i10X expansion panels (Discussion #1171 / ISSUE-081)
+        // EasyTouch ET24P ALSO reports model1=3 (with model2 in {13,14}; see
+        // EasyTouchBoard.expansionBoards), and IntelliTouch reuses model2 in {0..5}, so
+        // model1=3 alone is NOT a safe IntelliCenter-v3 marker.  Disambiguate by requiring
+        // BOTH that model2 is a known v3 personality byte ({1,2,3} above) AND header[1]===1
+        // (IntelliCenter uses header[1]=1; Touch systems use other values, e.g. 18).
+        // This rejects EasyTouch ([3,13]/[3,14]) while preserving the #1171 / ISSUE-081
+        // fix for v3.008 i10D + i10X ([3,3]).  If a future v3 personality appears, add its
+        // model2 byte to the set below (and to the variant table at lines 105-106).
         if ((model2 === 0 && (model1 === 23 || model1 >= 40)) ||
-            (model2 === 2 && model1 == 0)) {
+            (model2 === 2 && model1 == 0 && msg.header[1] === 1) ||
+            (model1 === 3 && (model2 === 1 || model2 === 2 || model2 === 3) && msg.header[1] === 1)) {
             state.equipment.controllerType = 'intellicenter';
             sys.board.modulesAcquired = false;
             sys.controllerType = ControllerType.IntelliCenter;
             logger.info(`Found Controller Board ${state.equipment.model || 'IntelliCenter'}, awaiting installed modules.`);
+            if (model1 === 3) logger.silly(`IntelliCenter v3 detected (panel variant byte28=${model2})`);
             EquipmentStateMessage.initIntelliCenter(msg);
         }
         else {
@@ -113,22 +128,30 @@ export class EquipmentStateMessage {
             sys.board.needsConfigChanges = true;
             setTimeout(function () { sys.checkConfiguration(); }, 300);
         }
+        // Set status = 1 AFTER controllerType change, because the controllerType setter
+        // resets state.status = 0 during RESETTING DATA
+        state.status = 1;
     }
     public static process(msg: Inbound) {
         Message.headerSubByte = msg.header[1];
         //console.log(process.memoryUsage());
         if (msg.action === 2 && state.isInitialized && sys.controllerType === ControllerType.Nixie) {
-            // Start over because we didn't have communication before but we now do.  This will fall into the if
-            // below so that it goes through the intialization process.  In this case we didn't see an OCP when we started
-            // but there clearly is one now.
+            // Start over because we didn't have communication before but we now do.
+            // Close the nixie board first, then initialize with the new controller type.
+            // Fix: Call initController AFTER the async close completes to avoid race condition.
             (async () => {
                 await sys.board.closeAsync();
                 logger.info(`Closed ${sys.controllerType} board`);
                 sys.controllerType = ControllerType.Unknown;
                 state.status = 0;
+                // Now initialize the correct controller type after nixie is closed
+                EquipmentStateMessage.initController(msg);
             })();
+            return; // Don't continue processing until async close/init completes
         }
-        if (!state.isInitialized) {
+        // If controller type is unknown (e.g., after a replay/system reset), we must re-detect the controller on Action 2
+        // even if state has been initialized from disk.
+        if (!state.isInitialized || sys.controllerType === ControllerType.Unknown) {
             msg.isProcessed = true;
             if (msg.action === 2) EquipmentStateMessage.initController(msg);
             else return;
@@ -136,18 +159,47 @@ export class EquipmentStateMessage {
         else if (!sys.board.modulesAcquired) {
             msg.isProcessed = true;
             if (msg.action === 204) {
-                let board = sys.board as IntelliCenterBoard;
                 // We have determined that the 204 message now contains the information
                 // related to the installed expansion boards.
-                console.log(`INTELLICENTER MODULES DETECTED, REQUESTING STATUS!`);
+                logger.info(`INTELLICENTER MODULES DETECTED, REQUESTING STATUS!`);
+
+                // IMPORTANT: v3 module decoding depends on `sys.equipment.isIntellicenterV3`, which is gated by controller firmware.
+                // During the "modules not acquired yet" bootstrap we must set firmware BEFORE calling `initExpansionModules()`
+                // so v3 systems (e.g. i10PS shared) are decoded with the correct nibble order.
+                if (msg.payload.length >= 44) {
+                    sys.equipment.controllerFirmware = (msg.extractPayloadByte(42) + (msg.extractPayloadByte(43) / 1000)).toString();
+                    (sys.board as IntelliCenterBoard).applyV3ValueMapOverrides();
+                }
+                sys.refineBoardForFirmware();
                 // Master = 13-14
                 // EXP1 = 15-16
                 // EXP2 = 17-18
-                let pc = msg.extractPayloadByte(40);
-                board.initExpansionModules(msg.extractPayloadByte(13), msg.extractPayloadByte(14),
-                    pc & 0x01 ? msg.extractPayloadByte(15) : 0x00, pc & 0x01 ? msg.extractPayloadByte(16) : 0x00,
-                    pc & 0x02 ? msg.extractPayloadByte(17) : 0x00, pc & 0x02 ? msg.extractPayloadByte(18) : 0x00,
-                    pc & 0x04 ? msg.extractPayloadByte(19) : 0x00, pc & 0x04 ? msg.extractPayloadByte(20) : 0x00);
+                // EXP3 = 19-20
+                // Byte 40 (pc) was historically treated as an expansion-presence bitmask
+                // (bit 0 = EXP1, bit 1 = EXP2, bit 2 = EXP3) on v1.x firmware.  On v3.008
+                // byte 40 reports 0x50 on BOTH a single-panel i8PS (no expansions) and on an
+                // i10D + 2x i10X system (two expansions populated) — see ISSUE-081.  So for
+                // v3 we bypass the pc gate for slots 1 and 2 (bytes 15-18) and pass raw bytes
+                // through; the board-level processExpansionModules decoder treats all-zero
+                // slot bytes as empty and deactivates those panels.
+                //
+                // ISSUE-088: Byte 19 always reports 0x02 on v3 firmware regardless of whether
+                // an expansion panel is installed (confirmed across 60+ captures on i8PS with
+                // no expansions).  This is a firmware constant, NOT an expansion indicator.
+                // Slot 3 (bytes 19-20) is only passed through when a lower expansion slot is
+                // populated, confirming a multi-expansion stack.
+                const isV3 = sys.equipment.isIntellicenterV3;
+                const pc = msg.extractPayloadByte(40);
+                const exp1A = isV3 || (pc & 0x01) ? msg.extractPayloadByte(15) : 0x00;
+                const exp1B = isV3 || (pc & 0x01) ? msg.extractPayloadByte(16) : 0x00;
+                const exp2A = isV3 || (pc & 0x02) ? msg.extractPayloadByte(17) : 0x00;
+                const exp2B = isV3 || (pc & 0x02) ? msg.extractPayloadByte(18) : 0x00;
+                const hasLowerExpansion = exp1A !== 0 || exp2A !== 0;
+                const exp3A = (isV3 && hasLowerExpansion) || (pc & 0x04) ? msg.extractPayloadByte(19) : 0x00;
+                const exp3B = (isV3 && hasLowerExpansion) || (pc & 0x04) ? msg.extractPayloadByte(20) : 0x00;
+                (sys.board as IntelliCenterBoard).initExpansionModules(
+                    msg.extractPayloadByte(13), msg.extractPayloadByte(14),
+                    exp1A, exp1B, exp2A, exp2B, exp3A, exp3B);
                 sys.equipment.setEquipmentIds();
             }
             else return;
@@ -175,12 +227,17 @@ export class EquipmentStateMessage {
                     state.time.hours = msg.extractPayloadByte(0);
                     state.time.minutes = msg.extractPayloadByte(1);
                     state.time.seconds = dt.getSeconds();
-                    state.mode = sys.controllerType !== ControllerType.IntelliCenter ? (msg.extractPayloadByte(9) & 0x81) : (msg.extractPayloadByte(9) & 0x01);
+                    state.mode = sys.controllerType !== ControllerType.IntelliCenter ? (msg.extractPayloadByte(9) & 0x81) : (msg.extractPayloadByte(9) & 0x03);
+                    if (sys.controllerType === ControllerType.IntelliCenter) {
+                        state.vacation = sys.general.options.vacation.enabled === true;
+                    }
 
                     // RKS: The units have been normalized for English and Metric for the overall panel.  It is important that the val numbers match for at least the temp units since
                     // the only unit of measure native to the Touch controllers is temperature they chose to name these C or F.  However, with the njsPC extensions this is non-semantic
                     // since pressure, volume, and length have been introduced.
                     sys.general.options.units = state.temps.units = msg.extractPayloadByte(9) & 0x04;
+                    const bodyUnits = state.temps.units === sys.board.valueMaps.tempUnits.getValue('C') ? 2 : 1;
+                    for (let i = 0; i < sys.bodies.length; i++) sys.bodies.getItemByIndex(i).capacityUnits = bodyUnits;
                     state.valve = msg.extractPayloadByte(10);
 
 
@@ -215,7 +272,9 @@ export class EquipmentStateMessage {
                     state.freeze = (msg.extractPayloadByte(9) & 0x08) === 0x08;
                     if (sys.controllerType === ControllerType.IntelliCenter) {
                         state.temps.waterSensor1 = fnTempFromByte(msg.extractPayloadByte(14));
-                        if (sys.bodies.length > 2 || sys.equipment.dual) state.temps.waterSensor2 = fnTempFromByte(msg.extractPayloadByte(15));
+                        // IntelliCenter: for 2-body non-shared systems, byte(15) is Body2 (Spa) water sensor.
+                        // Previously gated behind (>2 bodies || dual), which left Spa temp undefined and rendered as "--" in dashPanel.
+                        if (sys.bodies.length > 1 || sys.equipment.dual) state.temps.waterSensor2 = fnTempFromByte(msg.extractPayloadByte(15));
                         // We are making an assumption here in that the circuits are always labeled the same.
                         // 1=Spa/Body2
                         // 6=Pool/Body1
@@ -236,13 +295,20 @@ export class EquipmentStateMessage {
                                 if ((msg.extractPayloadByte(2) & 0x20) === 32) {
                                     tbody.temp = state.temps.waterSensor1;
                                     tbody.isOn = true;
-                                } else tbody.isOn = false;
+                                } else {
+                                    // Keep body temp visible even when body is currently off.
+                                    tbody.temp = state.temps.waterSensor1;
+                                    tbody.isOn = false;
+                                }
                             }
                             else if (state.circuits.getItemById(6).isOn === true) {
                                 tbody.temp = state.temps.waterSensor1;
                                 tbody.isOn = true;
                             }
-                            else tbody.isOn = false;
+                            else {
+                                tbody.temp = state.temps.waterSensor1;
+                                tbody.isOn = false;
+                            }
                         }
                         if (sys.bodies.length > 1) {
                             const tbody: BodyTempState = state.temps.bodies.getItemById(2, true);
@@ -256,12 +322,19 @@ export class EquipmentStateMessage {
                                 if ((msg.extractPayloadByte(2) & 0x01) === 1) {
                                     tbody.temp = sys.equipment.shared ? state.temps.waterSensor1 : state.temps.waterSensor2;
                                     tbody.isOn = true;
-                                } else tbody.isOn = false;
+                                } else {
+                                    // Keep body temp visible even when body is currently off.
+                                    tbody.temp = sys.equipment.shared ? state.temps.waterSensor1 : state.temps.waterSensor2;
+                                    tbody.isOn = false;
+                                }
                             } else if (state.circuits.getItemById(1).isOn === true) {
                                 tbody.temp = sys.equipment.shared ? state.temps.waterSensor1 : state.temps.waterSensor2;
                                 tbody.isOn = true;
                             }
-                            else tbody.isOn = false;
+                            else {
+                                tbody.temp = sys.equipment.shared ? state.temps.waterSensor1 : state.temps.waterSensor2;
+                                tbody.isOn = false;
+                            }
                         }
                         if (sys.bodies.length > 2) {
                             state.temps.waterSensor3 = fnTempFromByte(msg.extractPayloadByte(20));
@@ -469,11 +542,12 @@ export class EquipmentStateMessage {
                         case ControllerType.IntelliCenter:
                             {
                                 EquipmentStateMessage.processCircuitState(msg);
-                                // RKS: As of 1.04 the entire feature state is emitted on 204.  This message
-                                // used to contain the first 4 feature states starting in byte 8 upper 4 bits
-                                // and as of 1.047 release this was no longer reliable.  Macro circuits only appear
-                                // to be available on message 30-15 and 168-15.
-                                //EquipmentStateMessage.processFeatureState(msg);
+                                // v3.004+: DISABLED - Action 2 bytes 7-8 use non-bitmask encoding
+                                // Feature state for v3.004+ comes from Action 30 case 15 responses only
+                                // See: https://github.com/tagyoureit/nodejs-poolController/issues/XXX
+                                // if (sys.equipment.isIntellicenterV3) {
+                                //     EquipmentStateMessage.processFeatureStateV3(msg);
+                                // }
                                 sys.board.circuits.syncCircuitRelayStates();
                                 sys.board.circuits.syncVirtualCircuitStates();
                                 sys.board.valves.syncValveStates();
@@ -582,6 +656,121 @@ export class EquipmentStateMessage {
             case 96:
                 EquipmentStateMessage.processIntelliBriteMode(msg);
                 break;
+            case 179: {
+                // v3.004+ Action 179 - Heartbeat REQUEST from OCP
+                // OCP sends Action 179 TO a specific registered device.
+                // Device must respond with Action 180 TO OCP (dest=16)
+                let registrationAddress = Message.pluginAddress;
+                if (sys.controllerType === ControllerType.IntelliCenter) {
+                    const board = sys.board as IntelliCenterBoard;
+                    registrationAddress = board.getRegistrationAddress();
+                    if (board.isOwnHeartbeatPayload(msg.payload) && msg.dest !== registrationAddress) {
+                        logger.warn(`Ignoring IntelliCenter v3 heartbeat for device ${msg.dest}; expected device ${registrationAddress}.`);
+                    }
+                }
+                if (msg.dest === registrationAddress) {
+                    const configProcessing = sys.controllerType === ControllerType.IntelliCenter ? (sys.board as IntelliCenterBoard).isConfigQueueProcessing() : false;
+                    logger.info(`Received heartbeat request (Action 179) from OCP dest=${msg.dest}, responding with Action 180${configProcessing ? ' [CONFIG QUEUE ACTIVE]' : ''}`);
+                    const response: Outbound = Outbound.create({
+                        source: registrationAddress,
+                        dest: 16,  // Respond to OCP (16)
+                        action: 180,  // Action 180 = heartbeat response
+                        payload: Array(16).fill(0),  // 16 zeros (observed from wireless remote)
+                        retries: 0  // Don't retry heartbeat responses
+                    });
+                    response.sendAsync().catch(err => {
+                        // Log but don't fail on heartbeat errors
+                        logger.silly(`Heartbeat response error: ${err.message}`);
+                    });
+                }
+                msg.isProcessed = true;
+                break;
+            }
+            case 253: {
+                // v3.004+ registration confirmation. Use it to learn the live device address,
+                // but keep Action 217 as the registration-status source of truth.
+                if (sys.controllerType === ControllerType.IntelliCenter) {
+                    (sys.board as IntelliCenterBoard).processRegistrationMessage(msg);
+                }
+                msg.isProcessed = true;
+                break;
+            }
+            case 184: {
+                if (sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3) {
+                    const chan0 = msg.extractPayloadByte(0);
+                    const chan1 = msg.extractPayloadByte(1);
+                    const circIdx = msg.extractPayloadByte(2);
+                    const target0 = msg.extractPayloadByte(4);
+                    const target1 = msg.extractPayloadByte(5);
+                    if (chan0 === 148 && chan1 === 175) {
+                        const circuitId = circIdx + 1;
+                        let cstate = state.circuits.getInterfaceById(circuitId);
+                        if (cstate && cstate.isActive !== false) {
+                            if (target0 === 196 && target1 === 144) {
+                                cstate.action = sys.board.valueMaps.circuitActions.getValue('colorsync');
+                                cstate.emitEquipmentChange();
+                                for (let i = 0; i < sys.lightGroups.length; i++) {
+                                    let lg = sys.lightGroups.getItemByIndex(i);
+                                    if (lg.circuits.find(elem => elem.circuit === circuitId)) {
+                                        let sgrp = state.lightGroups.getItemById(lg.id);
+                                        if (sgrp.action === 0) {
+                                            sgrp.action = sys.board.valueMaps.circuitActions.getValue('colorsync');
+                                            sgrp.emitEquipmentChange();
+                                        }
+                                    }
+                                }
+                            } else if (target0 === 198 && target1 === 156) {
+                                cstate.action = 0;
+                                cstate.emitEquipmentChange();
+                            }
+                        }
+                    }
+                    if (chan0 === 88 && chan1 === 163 && target0 === 138 && target1 === 177) {
+                        const groupIdx = msg.extractPayloadByte(2);
+                        const cmdByte = msg.extractPayloadByte(6);
+                        const groupId = groupIdx + sys.board.equipmentIds.circuitGroups.start;
+                        let sgrp = state.lightGroups.getItemById(groupId, false);
+                        if (sgrp && sgrp.id === groupId) {
+                            if (cmdByte > 0) {
+                                let actionName = cmdByte === 1 ? 'colorswim' : cmdByte === 2 ? 'colorset' : 'colorsync';
+                                sgrp.action = sys.board.valueMaps.circuitActions.getValue(actionName);
+                                sgrp.emitEquipmentChange();
+                            } else {
+                                sgrp.action = 0;
+                                sgrp.emitEquipmentChange();
+                            }
+                        }
+                    }
+                    if (chan0 === 88 && chan1 === 163 && target0 === 168 && target1 === 237) {
+                        const groupIdx = msg.extractPayloadByte(2);
+                        const stateByte = msg.extractPayloadByte(6);
+                        const groupId = groupIdx + sys.board.equipmentIds.circuitGroups.start;
+                        let gstate = state.circuitGroups.getInterfaceById(groupId);
+                        if (gstate && gstate.id === groupId) {
+                            gstate.isOn = stateByte > 0;
+                            gstate.emitEquipmentChange();
+                        }
+                    }
+                }
+                msg.isProcessed = true;
+                break;
+            }
+            case 217: {
+                // v3.004+ Action 217 - Device list broadcast
+                // OCP broadcasts registered devices after Action 251→253 handshake
+                // Each packet contains info for ONE device
+                // Match by registration identity, not the current assumed address, because the OCP
+                // can assign a different runtime device address during bootstrap.
+                if (sys.controllerType === ControllerType.IntelliCenter) {
+                    (sys.board as IntelliCenterBoard).processRegistrationMessage(msg);
+                }
+                msg.isProcessed = true;
+                break;
+            }
+            case 171: {
+                EquipmentStateMessage.processDimmerLevel(msg);
+                break;
+            }
             case 197: {
                 // request for date/time on *Touch.  Use this as an indicator
                 // that SL has requested config and update lastUpdated date/time
@@ -600,17 +789,37 @@ export class EquipmentStateMessage {
                 state.time.month = msg.extractPayloadByte(7);
                 state.time.date = msg.extractPayloadByte(6);
                 sys.equipment.controllerFirmware = (msg.extractPayloadByte(42) + (msg.extractPayloadByte(43) / 1000)).toString();
+                // v3.004 adds 4 additional bytes (44-46) that are the time of day
+                // Byte 44: Hour (0-23)
+                // Byte 45: Minute (0-59)
+                // Byte 46: Second (0-59)
+                // Byte 47: Unknown - possibly DST indicator or status flag
                 if (sys.chlorinators.length > 0) {
-                    if (msg.extractPayloadByte(37, 255) !== 255) {
-                        const chlor = state.chlorinators.getItemById(1);
-                        chlor.superChlorRemaining = msg.extractPayloadByte(37) * 3600 + msg.extractPayloadByte(38) * 60;
+                    const chlor = state.chlorinators.getItemById(1);
+                    const hours = msg.extractPayloadByte(37, 255);
+                    const minutes = msg.extractPayloadByte(38, 0);
+                    if (hours !== 255) {
+                        chlor.superChlorRemaining = hours * 3600 + minutes * 60;
+                        chlor.superChlor = true;
+                        EquipmentStateMessage._superChlorOffCount = 0;
                     } else {
-                        const chlor = state.chlorinators.getItemById(1);
-                        chlor.superChlorRemaining = 0;
-                        chlor.superChlor = false;
+                        EquipmentStateMessage._superChlorOffCount = (EquipmentStateMessage._superChlorOffCount || 0) + 1;
+                        if (EquipmentStateMessage._superChlorOffCount >= 2) {
+                            chlor.superChlorRemaining = 0;
+                            chlor.superChlor = false;
+                        }
                     }
                 }
-                ExternalMessage.processFeatureState(9, msg);
+                // v3.004+: Do NOT process feature states from Action 204!
+                // Evidence from packet captures shows Action 204 byte 19 contains STALE feature state
+                // that doesn't update when features change. The authoritative source for v3 feature
+                // state is Action 30 case 15 (config response to Action 222 [15,0] request).
+                // Action 204 continuously broadcasts stale data and overwrites the correct state.
+                //
+                // v1.x: Feature states at offset 9 - this was deemed reliable in 2020.
+                if (!sys.equipment.isIntellicenterV3) {
+                    ExternalMessage.processFeatureState(9, msg);
+                }
                 //if (sys.equipment.dual === true) {
                 //    // For IntelliCenter i10D the body state is on byte 26 of the 204.  This impacts circuit 6.
                 //    let byte = msg.extractPayloadByte(26);
@@ -642,10 +851,175 @@ export class EquipmentStateMessage {
                     state.temps.bodies.getItemById(cover2.body + 1).isCovered = scover2.isClosed = (msg.extractPayloadByte(30) & 0x0002) > 0;
                 }
                 sys.board.schedules.syncScheduleStates();
+                // v3.004+ alert queue — decode the OCP "Status" badge bitmaps so
+                // state.equipment.messages mirrors what the physical OCP/ICP/Wireless
+                // panels surface. This lives on the same data path the Nixie REST
+                // heaters and RS-485 port already use (setMessageByCode / removeItemByCode),
+                // so dashPanel's sysMessageIcon picks it up automatically via `sysmessages`.
+                if (sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3) {
+                    EquipmentStateMessage.processAlertQueue(msg);
+                }
                 msg.isProcessed = true;
                 state.emitEquipmentChanges();
                 break;
         }
+    }
+    // Decodes the OCP "Status" alert queue carried in Action 204 on IntelliCenter v3.004+.
+    // Bit / byte map (see .plan/ISSUES-3.md ISSUE-072 progress notes):
+    //   byte[31] — pumps 9–16 comms-lost bitmap (bit N → slot 9+N)
+    //   byte[32] — pumps 1–8  comms-lost bitmap (bit N → slot 1+N)
+    //   byte[33] — TBD (candidate: IntelliChem family bitmap)
+    //   byte[34] — chlorinator comms-lost flag (0=ok, 1=comms lost) — confirmed 2026-05-09
+    //   byte[36] — heaters 1–8 comms-lost bitmap (bit N → heater slot 1+N), working hypothesis:
+    //              mirrors the pump bitmap layout (user intuition reconfirmed 2026-04-20);
+    //              prior "family bitmap" theory was an artefact of the test topology (HP at slot 2,
+    //              3× UltraTemp at slots 4/5/6 going offline together).
+    //   byte[37]  — consistently 255 when alerts present — likely padding/reserved
+    //   byte[38], byte[39] — TBD (possibly heaters 9–16, or chlorinator/IntelliChem families)
+    // Alert detection window is device-dependent (pumps ~15–30s, heaters can be minutes);
+    // we decode whatever 204 reports and do not poll/spoof.
+    // A204 alert visibility: maps each A204-decoded alert to the corresponding
+    // sys.alerts notification bitmask + bit. Used both by processAlertQueue (gating
+    // writes) and by Alerts.applyVisibilityToMessages (sweep on preference change).
+    public static resolveA204AlertVisibility(code: string): { category: string; bit: number } | undefined {
+        const parsed = code.split(':');
+        if (parsed.length < 3) return undefined;
+        const cat = parsed[0];
+        const idStr = parsed[1];
+        const sub = parsed[2];
+        if (sub !== 'comms') return undefined;
+        if (cat === 'pump') return { category: 'pump', bit: 6 };
+        if (cat === 'chlorinator') return { category: 'chlorinator', bit: 4 };
+        if (cat === 'intellichem') return { category: 'intellichem', bit: 13 };
+        if (cat === 'heater') {
+            const slot = parseInt(idStr, 10);
+            if (!isFinite(slot)) return undefined;
+            const heater = sys.heaters.getItemById(slot);
+            const t = heater && typeof heater.type !== 'undefined'
+                ? sys.board.valueMaps.heaterTypes.transform(heater.type)
+                : undefined;
+            const name = t && (t as any).name;
+            if (name === 'hybrid') return { category: 'hybrid', bit: 21 };
+            if (name === 'mastertemp' || name === 'maxetherm' || name === 'eti250' || name === 'gas') return { category: 'connectedGas', bit: 14 };
+            // ultratemp + heatpump (and unknown) fall under the UltraTemp notification family.
+            return { category: 'ultratemp', bit: 13 };
+        }
+        return undefined;
+    }
+    public static isA204AlertEnabled(category: string, bit: number): boolean {
+        // Filtering applies only to IntelliCenter v3 — sys.alerts is populated by IC v3
+        // piggyback decode of A168 cat=13 sel 12-18. On other controllers this would
+        // silently hide alerts whose preference defaults to 0 (e.g. IntelliChem comms on
+        // IntelliTouch/EasyTouch/Nixie).
+        if (!sys.equipment.isIntellicenterV3) return true;
+        const a = sys.alerts;
+        let mask = 0;
+        switch (category) {
+            case 'pump':         mask = a.pumpNotifications | 0; break;
+            case 'ultratemp':    mask = a.ultratempNotifications | 0; break;
+            case 'hybrid':       mask = a.hybridNotifications | 0; break;
+            case 'connectedGas': mask = a.connectedGasNotifications | 0; break;
+            case 'chlorinator':  mask = a.chlorinatorNotifications | 0; break;
+            case 'intellichem':  mask = a.intellichemNotifications | 0; break;
+            case 'circuit':      mask = a.circuitNotifications | 0; break;
+            default: return true; // unknown categories: don't filter
+        }
+        return (mask & (1 << bit)) !== 0;
+    }
+    private static processAlertQueue(msg: Inbound) {
+        if (msg.payload.length < 40) return;
+        const syncAlert = (code: string, shouldExistRaw: boolean, severity: string, message: string) => {
+            const vis = EquipmentStateMessage.resolveA204AlertVisibility(code);
+            const visible = vis ? EquipmentStateMessage.isA204AlertEnabled(vis.category, vis.bit) : true;
+            const shouldExist = shouldExistRaw && visible;
+            const exists = state.equipment.messages.exists((m: any) => m.code === code);
+            if (shouldExist && !exists) state.equipment.messages.setMessageByCode(code, severity, message);
+            else if (!shouldExist && exists) state.equipment.messages.removeItemByCode(code);
+        };
+        // One-time cleanup of legacy family-keyed codes from the earlier "family bitmap"
+        // hypothesis (pre-2026-04-20). These are never written by the current slot-indexed
+        // decoder, so any lingering entries in poolState.json are stale. removeItemByCode
+        // is a no-op (and does not emit) when the code is absent.
+        ['heater:hp:comms', 'heater:ut:comms', 'heater:unknown:comms'].forEach(c => {
+            if (state.equipment.messages.exists((m: any) => m.code === c)) {
+                state.equipment.messages.removeItemByCode(c);
+            }
+        });
+        // Pumps 1–16 (bytes 31/32). Bit-to-slot mapping is universal — even relay-only pump
+        // types fire the bit because OCP polls every configured slot regardless of type.
+        const pumpsLo = msg.extractPayloadByte(32, 0);
+        const pumpsHi = msg.extractPayloadByte(31, 0);
+        for (let slot = 1; slot <= 16; slot++) {
+            const byte = slot <= 8 ? pumpsLo : pumpsHi;
+            const bit = (slot - 1) % 8;
+            const isAlerting = (byte & (1 << bit)) !== 0;
+            const code = `pump:${slot}:comms`;
+            const pump = sys.pumps.getItemById(slot);
+            const name = pump && pump.isActive && pump.name ? pump.name : `Pump ${slot}`;
+            syncAlert(code, isAlerting, 'error', `Communication lost with ${name}`);
+        }
+        // Heaters 1–8 (byte 36) — slot-indexed, same layout the pumps use. Names come from
+        // the configured heater at each slot; code `heater:{slot}:comms` matches the existing
+        // Nixie REST producer in `controller/nixie/heaters/Heater.ts`, so OCP-broadcast and
+        // Nixie-REST comm-lost signals unify into a single message per heater.
+        const heaterByte = msg.extractPayloadByte(36, 0);
+        for (let slot = 1; slot <= 8; slot++) {
+            const bit = slot - 1;
+            const isAlerting = (heaterByte & (1 << bit)) !== 0;
+            const code = `heater:${slot}:comms`;
+            const heater = sys.heaters.getItemById(slot);
+            const name = heater && heater.isActive && heater.name ? heater.name : `Heater ${slot}`;
+            syncAlert(code, isAlerting, 'error', `Communication lost with ${name}`);
+        }
+        // Chlorinator comms-lost (byte 34) — simple boolean flag (0=ok, 1=comms lost).
+        // Confirmed 2026-05-09: flips to 1 ~2.5min after chlorinator stops responding,
+        // clears to 0 ~30s after comms restored.
+        const chlorByte = msg.extractPayloadByte(34, 0);
+        const chlor = sys.chlorinators.getItemById(1);
+        const chlorName = chlor && chlor.isActive && chlor.name ? chlor.name : 'Chlorinator 1';
+        syncAlert('chlorinator:1:comms', chlorByte !== 0, 'error', `Communication lost with ${chlorName}`);
+        // Remaining bytes (33, 38, 39) + heaters 9–16 — not decoded yet. Intentionally NOT
+        // emitted to state.equipment.messages to avoid false positives. See ISSUE-072 progress
+        // notes for the remaining test plan (IntelliChem isolation, heater 9–16 probe).
+
+        // Freeze manual override bitmask (byte 47).
+        // bit 0 = Pool body manually overridden during freeze protection
+        // bit 1 = Spa body manually overridden during freeze protection
+        // Confirmed 2026-05-12 via live OCP captures: pressing a body button on ICP while
+        // that body is already ON from freeze cycling triggers "manual override in freeze"
+        // (heater activates, override timer starts). OCP sets the corresponding bit here.
+        const freezeOverrideByte = msg.extractPayloadByte(47, 0);
+        const poolBody = state.temps.bodies.getItemById(1);
+        const spaBody = state.temps.bodies.getItemById(2);
+        if (state.freeze) {
+            if (poolBody) poolBody.manualFreezeOverride = (freezeOverrideByte & 0x01) !== 0;
+            if (spaBody) spaBody.manualFreezeOverride = (freezeOverrideByte & 0x02) !== 0;
+        } else {
+            if (poolBody) poolBody.manualFreezeOverride = false;
+            if (spaBody) spaBody.manualFreezeOverride = false;
+        }
+
+        // Active delay state (bytes 26-28) — runtime indicators of currently-running delays.
+        const freezeDelay = msg.extractPayloadByte(26, 0);
+        const valveDelay = msg.extractPayloadByte(27, 0);
+        const heaterCooldownDelay = msg.extractPayloadByte(28, 0);
+        if (heaterCooldownDelay > 0) state.delay = 34;
+        else if (valveDelay > 0) state.delay = 36;
+        else if (freezeDelay > 0) state.delay = 38;
+        else state.delay = 0;
+    }
+    private static processDimmerLevel(msg: Inbound) {
+        let circuitId = msg.extractPayloadByte(0);
+        let encoded = msg.extractPayloadByte(1);
+        let level = encoded > 0 ? (encoded * 10) + 30 : 0;
+        let circuit = sys.circuits.getItemById(circuitId);
+        let cstate = state.circuits.getItemById(circuitId);
+        if (circuit.isActive !== false) {
+            circuit.level = level;
+            cstate.level = level;
+            state.emitEquipmentChanges();
+        }
+        msg.isProcessed = true;
     }
     private static processCircuitState(msg: Inbound) {
         // The way this works is that there is one byte per 8 circuits for a total of 5 bytes or 40 circuits.  The
@@ -661,6 +1035,7 @@ export class EquipmentStateMessage {
                 let circuit = sys.circuits.getItemById(circuitId, false, { isActive: false });
                 if (circuit.isActive !== false) {
                     let cstate = state.circuits.getItemById(circuitId, circuit.isActive);
+                    const wasOn = cstate.isOn;
                     // For IntelliCenter i10D body circuits are not reported here.
                     let isOn = ((circuitId === 6 || circuitId === 1) && sys.equipment.dual === true) ? cstate.isOn : (byte & (1 << j)) > 0;
                     //let isOn = (byte & (1 << j)) > 0;
@@ -720,6 +1095,53 @@ export class EquipmentStateMessage {
             }
         }
         state.emitEquipmentChanges();
+        msg.isProcessed = true;
+    }
+
+    private static processFeatureStateV3(msg: Inbound) {
+        // DISABLED: v3.004+ Action 2 bytes 7-8 do NOT use simple bitmask encoding!
+        //
+        // Analysis from replay 76 (Dec 2024):
+        // - F1 on → byte7=16 (bit 4), byte8=0
+        // - F1+F2 → byte7=32 (bit 5), byte8=1
+        // - F1+F2+F3 → byte7=64 (bit 6), byte8=2
+        //
+        // This is NOT a bitmask - it appears to be some kind of encoded state.
+        // Using this data corrupts feature state and causes wrong features to display.
+        //
+        // For v3.004+, feature state must come from:
+        // 1. Action 30 case 15 responses (when njsPC requests via Action 222)
+        // 2. TODO: Snoop on Action 30/15 going to Wireless (dest=36) for real-time updates
+        //
+        // DO NOT ENABLE THIS FUNCTION until the encoding is fully understood.
+        msg.isProcessed = true;
+        return;
+        
+        // Original broken code kept for reference:
+        /*
+        const byte7 = msg.extractPayloadByte(7);
+        const byte8 = msg.extractPayloadByte(8);
+        const featureStateBits = byte7 | (byte8 << 8);
+        
+        let featureId = sys.board.equipmentIds.features.start;
+        let maxFeatureId = sys.features.getMaxId(true, 0);
+        
+        for (let j = 0; featureId <= maxFeatureId && j < 16; j++) {
+            let feature = sys.features.getItemById(featureId, false, { isActive: false });
+            if (feature.isActive !== false) {
+                let fstate = state.features.getItemById(featureId, true);
+                let isOn = (featureStateBits & (1 << j)) > 0;
+                sys.board.circuits.setEndTime(feature, fstate, isOn);
+                fstate.isOn = isOn;
+                fstate.name = feature.name;
+            }
+            else {
+                state.features.removeItemById(featureId);
+            }
+            featureId++;
+        }
+        state.emitEquipmentChanges();
+        */
         msg.isProcessed = true;
     }
 

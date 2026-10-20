@@ -195,8 +195,8 @@ export class StateSocket {
                 let id = parseInt(data.id, 10);
                 if (!isNaN(id) && typeof data.toggle !== 'undefined')
                     if (utils.makeBool(data.toggle)) await sys.board.circuits.toggleCircuitStateAsync(id);
-                else if (!isNaN(id) && (typeof data.isOn !== 'undefined' || typeof data.state !== 'undefined')) {
-                    await sys.board.circuits.setCircuitStateAsync(id, utils.makeBool(data.isOn || typeof data.state));
+                if (!isNaN(id) && (typeof data.isOn !== 'undefined' || typeof data.state !== 'undefined')) {
+                    await sys.board.circuits.setCircuitStateAsync(id, utils.makeBool(typeof data.isOn !== 'undefined' ? data.isOn : data.state));
                 }
             }
             catch (err) { logger.error(`Socket /circuit error: ${err.message}`); }
@@ -300,10 +300,38 @@ export class StateSocket {
             } 
             catch (err) { next(err); }
         }); 
+        app.put('/state/light/setTheme', async (req, res, next) => {
+            try {
+                let theme = await state.circuits.setLightThemeAsync(parseInt(req.body.id, 10), parseInt(req.body.theme, 10));
+                return res.status(200).send(theme);
+            }
+            catch (err) { next(err); }
+        });
 
         app.put('/state/circuit/setDimmerLevel', async (req, res, next) => {
             try {
                 let circuit = await sys.board.circuits.setDimmerLevelAsync(parseInt(req.body.id, 10), parseInt(req.body.level, 10));
+                return res.status(200).send(circuit);
+            }
+            catch (err) { next(err); }
+        });
+        app.put('/state/light/setBrightness', async (req, res, next) => {
+            try {
+                let circuit = await sys.board.circuits.setDimmerLevelAsync(
+                    parseInt(req.body.id, 10),
+                    parseInt(typeof req.body.level !== 'undefined' ? req.body.level : req.body.brightness, 10)
+                );
+                return res.status(200).send(circuit);
+            }
+            catch (err) { next(err); }
+        });
+        app.put('/state/light/setColor', async (req, res, next) => {
+            try {
+                let circuit = await sys.board.circuits.setLightColorAsync(parseInt(req.body.id, 10), {
+                    red: parseInt(typeof req.body.red !== 'undefined' ? req.body.red : req.body.r, 10),
+                    green: parseInt(typeof req.body.green !== 'undefined' ? req.body.green : req.body.g, 10),
+                    blue: parseInt(typeof req.body.blue !== 'undefined' ? req.body.blue : req.body.b, 10)
+                });
                 return res.status(200).send(circuit);
             }
             catch (err) { next(err); }

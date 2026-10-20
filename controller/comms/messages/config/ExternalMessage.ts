@@ -16,12 +16,97 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 import { Inbound } from "../Messages";
-import { sys, Body, ICircuitGroup, LightGroup, CircuitGroup } from "../../../Equipment";
+import { sys, Body, ICircuitGroup, LightGroup, CircuitGroup, Cover, SecurityRole, Remote } from "../../../Equipment";
 import { state, ICircuitGroupState, LightGroupState, CircuitGroupState } from "../../../State";
-import { Timestamp, utils } from "../../../Constants";
+import { ControllerType, Timestamp, utils } from "../../../Constants";
 import { logger } from "../../../../logger/Logger";
+import { webApp } from "../../../../web/Server";
+import { CoverMessage } from "./CoverMessage";
 export class ExternalMessage {
+    private static normalizePumpBodyCode(rawBody: number): number {
+        const poolBody = sys.board.valueMaps.pumpBodies.getValue('pool');
+        const spaBody = sys.board.valueMaps.pumpBodies.getValue('spa');
+        const poolSpaBody = sys.board.valueMaps.pumpBodies.getValue('poolspa');
+        const sharedPool = sys.board.valueMaps.bodies.getValue('pool');
+        const sharedSpa = sys.board.valueMaps.bodies.getValue('spa');
+        const sharedPoolSpa = sys.board.valueMaps.bodies.getValue('poolspa');
+        if (rawBody === sharedPool) return poolBody;
+        if (rawBody === sharedSpa) return spaBody;
+        if (rawBody === sharedPoolSpa) return poolSpaBody;
+        return rawBody;
+    }
+    private static decodePumpBodyCode(rawBody: number): number | undefined {
+        const normalized = ExternalMessage.normalizePumpBodyCode(rawBody);
+        return sys.board.valueMaps.pumpBodies.valExists(normalized) ? normalized : undefined;
+    }
+    private static normalizeIntelliCenterPumpAddress(rawAddress: number): number {
+        if (rawAddress > 0 && rawAddress <= 16) return rawAddress + 95;
+        return rawAddress;
+    }
     public static processIntelliCenter(msg: Inbound): void {
+        // IntelliCenter v3.x: treat Wireless/ICP/Indoor -> OCP packets as requests, not source-of-truth.
+        // We are a bus listener, so we will see traffic not addressed to us; do not apply those requests to state.
+        // Only accept OCP-originated messages here. If/when OCP applies a request, it will broadcast authoritative
+        // state/config via other message types (e.g., Action 30 / 204).
+        if (sys.equipment.isIntellicenterV3 && msg.dest === 16 && msg.source !== 16) {
+            // ISSUE-073 exception: body capacity updates via Action 168 cat 13 sub 4-7 are NOT
+            // reliably reflected by a subsequent Action 30 cat 13 broadcast. In the field the OCP
+            // re-broadcasts [13,0] (Pool) ~20s after the change, but often NEVER re-broadcasts
+            // [13,1] (Spa). Decoding the capacity from the ICP's own Action 168 request (which the
+            // OCP is about to ACK) lets njsPC stay in sync without waiting on a broadcast that may
+            // never arrive. If the broadcast does arrive later, EquipmentMessage will overwrite with
+            // the same value.
+            if (msg.action === 168 && msg.extractPayloadByte(0) === 13) {
+                const sub = msg.extractPayloadByte(1, 0);
+                const selector = msg.extractPayloadByte(2, -1);
+                if (sub === 0 && selector >= 4 && selector <= 7) {
+                    const bodyId = selector - 3;
+                    if (sys.equipment.maxBodies >= bodyId) {
+                        const hi = msg.extractPayloadByte(3, 0);
+                        const lo = msg.extractPayloadByte(4, 0);
+                        const capacity = ((hi << 8) | lo) * 1000;
+                        const cbody = sys.bodies.getItemById(bodyId);
+                        if (typeof cbody !== 'undefined' && cbody.id === bodyId) {
+                            cbody.capacity = capacity;
+                            logger.silly(`v3.004+ ICP body capacity: body${bodyId} -> ${capacity} gal`);
+                        }
+                    }
+                }
+                if (sub === 0 && selector >= 12 && selector <= 18) {
+                    if (selector === 12) {
+                        if (msg.payload.length > 3) {
+                            const value = msg.extractPayloadByte(3, 0);
+                            sys.alerts.circuitNotifications = value;
+                            sys.alerts.setRaw(12, [value]);
+                            if (typeof webApp !== 'undefined' && webApp) webApp.emitToClients('alertConfig', sys.alerts.get(true));
+                        }
+                    } else {
+                        ExternalMessage.applyAlertNotificationFromExternal(msg, selector, 3);
+                    }
+                }
+            }
+            // ISSUE-078 Part B: chlorinator live-edit piggyback (Action 168 cat=7 sub=0)
+            // — Wireless → OCP request direction. See processIntelliCenterV3Chlor168 for
+            // the validated decode and the rationale.
+            if (msg.action === 168 && msg.extractPayloadByte(0) === 7 && msg.extractPayloadByte(1) === 0) {
+                ExternalMessage.processIntelliCenterV3Chlor168(msg);
+            }
+            msg.isProcessed = true;
+            return;
+        }
+        // ISSUE-078 Part D (defense-in-depth): OCP-originated Action 168 cat=7 sub=0 broadcasts
+        // (src=16, dest=15) were observed in `logs/packetLog(2026-04-19_19-16-39).log`. They
+        // bypass the Wireless→OCP guard above and would otherwise fall through to the v1.x
+        // `processChlorinator` below, which misdecodes bytes 7/8 and risks a remove if
+        // payload[10]=0 ever appears. Route them through the validated v3 decoder instead.
+        if (sys.equipment.isIntellicenterV3
+            && msg.action === 168
+            && msg.extractPayloadByte(0) === 7
+            && msg.extractPayloadByte(1) === 0) {
+            ExternalMessage.processIntelliCenterV3Chlor168(msg);
+            msg.isProcessed = true;
+            return;
+        }
         switch (msg.extractPayloadByte(0)) {
             case 0: // Setpoints/HeatMode
                 ExternalMessage.processTempSettings(msg);
@@ -39,6 +124,7 @@ export class ExternalMessage {
                 ExternalMessage.processPump(msg);
                 break;
             case 5: // Remotes
+                ExternalMessage.processRemotes(msg);
                 break;
             case 6: // Light/Circuit group
                 ExternalMessage.processGroupSettings(msg);
@@ -56,6 +142,7 @@ export class ExternalMessage {
                 ExternalMessage.processHeater(msg);
                 break;
             case 11: // Security
+                ExternalMessage.processSecurity(msg);
                 break;
             case 12: // Pool Settings Alias, owner...etc.
                 ExternalMessage.processPool(msg);
@@ -63,7 +150,9 @@ export class ExternalMessage {
             case 13: // Bodies (Manual heat, capacities)
                 ExternalMessage.processBodies(msg);
                 break;
-            case 14: // Covers
+            case 14: // Covers (ISSUE-075 #5: route A168 cat=14 into CoverMessage so wireless/piggyback
+                //             cover edits are ingested without waiting for the OCP's A30 rebroadcast)
+                CoverMessage.processA168(msg);
                 break;
             case 15: // Circuit, feature, group, and schedule States
                 ExternalMessage.processCircuitState(3, msg);
@@ -147,7 +236,7 @@ export class ExternalMessage {
                 msg.isProcessed = true;
                 break;
             case 8: // Country
-                sys.general.location.country = msg.extractPayloadString(3, 16);
+                sys.general.location.country = msg.extractPayloadString(3, 32);
                 msg.isProcessed = true;
                 break;
             case 9: // City
@@ -199,9 +288,20 @@ export class ExternalMessage {
                             sgroup = state.lightGroups.getItemById(groupId, true);
                             sys.circuitGroups.removeItemById(groupId);
                             state.circuitGroups.removeItemById(groupId);
-                            sgroup.lightingTheme = group.lightingTheme = msg.extractPayloadByte(4) >> 2;
+                            let newTheme = msg.extractPayloadByte(4) >> 2;
+                            let oldTheme = sgroup.lightingTheme;
+                            sgroup.lightingTheme = group.lightingTheme = newTheme;
                             sgroup.type = group.type = type;
                             sgroup.isActive = group.isActive = true;
+                            if (newTheme !== oldTheme && sgroup.isOn) {
+                                let lgState = sgroup as LightGroupState;
+                                lgState.action = sys.board.valueMaps.circuitActions.getValue('settheme');
+                                lgState.emitEquipmentChange();
+                                setTimeout(() => {
+                                    lgState.action = 0;
+                                    lgState.emitEquipmentChange();
+                                }, 15000);
+                            }
                             msg.isProcessed = true;
                             break;
                         case 2:
@@ -225,9 +325,12 @@ export class ExternalMessage {
 
                         }
                     }
-                    group.eggTimer = (msg.extractPayloadByte(38) * 60) + msg.extractPayloadByte(39);
+                    if (sys.equipment.isIntellicenterV3) {
+                        group.eggTimer = (msg.extractPayloadByte(40) * 60) + msg.extractPayloadByte(41);
+                    } else {
+                        group.eggTimer = (msg.extractPayloadByte(38) * 60) + msg.extractPayloadByte(39);
+                    }
                     group.dontStop = group.eggTimer === 1440;
-                    // sgroup.eggTimer = group.eggTimer;
                     if (type === 1) {
                         let g = group as LightGroup;
                         for (let i = 0; i < 16; i++) {
@@ -268,10 +371,23 @@ export class ExternalMessage {
         }
     }
     public static processIntelliCenterState(msg) {
-        ExternalMessage.processCircuitState(2, msg);
-        ExternalMessage.processFeatureState(8, msg);
-        ExternalMessage.processScheduleState(14, msg);
-        ExternalMessage.processCircuitGroupState(12, msg);
+        // This is called from Action 30 case 15 (config message) - NOT Action 168 case 15 (wireless message).
+        // Action 30 and Action 168 have different payload structures!
+        // 
+        // v1.x: Original offsets (2, 8, 14, 12) - in place since Oct 2019, working.
+        // v3.004+: Different structure, requires offsets (3, 9, 15, 13) to match wireless message layout.
+        if (sys.equipment.isIntellicenterV3) {
+            ExternalMessage.processCircuitState(3, msg);
+            ExternalMessage.processFeatureState(9, msg);
+            ExternalMessage.processScheduleState(15, msg);
+            ExternalMessage.processCircuitGroupState(13, msg);
+        } else {
+            // v1.x offsets - preserve original behavior since Oct 2019
+            ExternalMessage.processCircuitState(2, msg);
+            ExternalMessage.processFeatureState(8, msg);
+            ExternalMessage.processScheduleState(14, msg);
+            ExternalMessage.processCircuitGroupState(12, msg);
+        }
     }
     private static processHeater(msg: Inbound) {
         // So a user is changing the heater info.  Lets
@@ -421,33 +537,38 @@ export class ExternalMessage {
                     gstate.name = group.name;
                     gstate.type = group.type;
                     // Now calculate out the sync/set/swim operations.
-                    if (gstate.dataName === 'lightGroup' && start === 13) {
+                    if (gstate.dataName === 'lightGroup') {
                         let lg = gstate as LightGroupState;
-                        let ndx = lg.id - sys.board.equipmentIds.circuitGroups.start;
-                        let byteNdx = Math.floor(ndx / 4);
-                        let bitNdx = (ndx * 2) - (byteNdx * 8);
-                        let byte = msg.extractPayloadByte(start + 15 + byteNdx, 255);
-                        //console.log(`ndx:${start + 15 + byteNdx} byte: ${byte}, bit: ${bitNdx}`);
-                        byte = ((byte >> bitNdx) & 0x0003);
-                        // Each light group is represented by two bits on the status byte.  There are 3 status bytes that give us only 12 of the 16 on the config stream but the 168 message
-                        // does acutall send 4 so all are represented there.
-                        // [10] = Set
-                        // [01] = Swim
-                        // [00] = Sync
-                        // [11] = No sequencing underway.
-                        switch (byte) {
-                            case 0: // Sync
-                                lg.action = sys.board.valueMaps.circuitActions.getValue('colorsync');
-                                break;
-                            case 1: // Color swim
-                                lg.action = sys.board.valueMaps.circuitActions.getValue('colorswim');
-                                break;
-                            case 2: // Color set
-                                lg.action = sys.board.valueMaps.circuitActions.getValue('colorset');
-                                break;
-                            default:
-                                lg.action = 0;
-                                break;
+                        if (!isOn) lg.action = 0;
+                        else if (sys.equipment.isIntellicenterV3) {
+                        }
+                        else if (start === 13) {
+                            let ndx = lg.id - sys.board.equipmentIds.circuitGroups.start;
+                            let byteNdx = Math.floor(ndx / 4);
+                            let bitNdx = (ndx * 2) - (byteNdx * 8);
+                            let byte = msg.extractPayloadByte(start + 15 + byteNdx, 255);
+                            //console.log(`ndx:${start + 15 + byteNdx} byte: ${byte}, bit: ${bitNdx}`);
+                            byte = ((byte >> bitNdx) & 0x0003);
+                            // Each light group is represented by two bits on the status byte.  There are 3 status bytes that give us only 12 of the 16 on the config stream but the 168 message
+                            // does acutall send 4 so all are represented there.
+                            // [10] = Set
+                            // [01] = Swim
+                            // [00] = Sync
+                            // [11] = No sequencing underway.
+                            switch (byte) {
+                                case 0: // Sync
+                                    lg.action = sys.board.valueMaps.circuitActions.getValue('colorsync');
+                                    break;
+                                case 1: // Color swim
+                                    lg.action = sys.board.valueMaps.circuitActions.getValue('colorswim');
+                                    break;
+                                case 2: // Color set
+                                    lg.action = sys.board.valueMaps.circuitActions.getValue('colorset');
+                                    break;
+                                default:
+                                    lg.action = 0;
+                                    break;
+                            }
                         }
                     }
                     else if(gstate.dataName === 'circuitGroup') {
@@ -465,6 +586,64 @@ export class ExternalMessage {
         msg.isProcessed = true;
     }
 
+    private static processRemotes(msg: Inbound) {
+        let remoteId = msg.extractPayloadByte(2) + 1;
+        let remote: Remote = sys.remotes.getItemById(remoteId, true);
+        remote.type = msg.extractPayloadByte(3);
+        remote.isActive = msg.extractPayloadByte(4) === 1;
+        remote.pumpId = msg.extractPayloadByte(5);
+        remote.address = Math.max(msg.extractPayloadByte(6) - 63, 0);
+        remote.body = msg.extractPayloadByte(7);
+        let type = sys.board.valueMaps.remoteTypes.transform(remote.type);
+        for (let b = 0; b < 10; b++) {
+            if (b >= type.maxButtons) { remote['button' + (b + 1)] = undefined; continue; }
+            remote['button' + (b + 1)] = msg.extractPayloadByte(8 + b);
+        }
+        remote.name = msg.extractPayloadString(18, 16);
+        if (remote.type === 0 || !remote.isActive) sys.remotes.removeItemById(remoteId);
+        msg.isProcessed = true;
+    }
+
+    private static processSecurity(msg: Inbound) {
+        const item = msg.extractPayloadByte(1, 0);
+        if (item === 0) {
+            sys.security.roles.clear();
+        }
+        const roleId = item + 1;
+        const pinNumber = ((msg.extractPayloadByte(3, 0) & 0xFF) << 8) | (msg.extractPayloadByte(4, 0) & 0xFF);
+        const roleName = msg.extractPayloadString(5, 16).trim();
+        const permissionsBytes = [
+            msg.extractPayloadByte(21, 0),
+            msg.extractPayloadByte(22, 0),
+            msg.extractPayloadByte(23, 0),
+            msg.extractPayloadByte(24, 0)
+        ];
+        const permissionsMask =
+            ((permissionsBytes[0] & 0xFF) * 16777216) +
+            ((permissionsBytes[1] & 0xFF) * 65536) +
+            ((permissionsBytes[2] & 0xFF) * 256) +
+            (permissionsBytes[3] & 0xFF);
+        const timeout = msg.extractPayloadByte(25, 0);
+        const hasRoleData = item === 0 || roleName.length > 0 || permissionsMask > 0;
+        if (hasRoleData) {
+            const role: SecurityRole = sys.security.roles.getItemById(roleId, true);
+            role.name = roleName;
+            role.timeout = timeout;
+            role.flag1 = msg.extractPayloadByte(2, 0);
+            role.flag2 = permissionsBytes[3];
+            role.pin = pinNumber.toString().padStart(4, '0');
+            role.permissionsMask = permissionsMask;
+            role.permissionsBytes = permissionsBytes;
+            if (item === 0) {
+                sys.security.enabledByte = permissionsBytes[3];
+                sys.security.enabled = (permissionsBytes[3] & 0x80) === 0x80;
+                sys.security.guestEnabled = (permissionsBytes[3] & 0x40) === 0x40;
+            }
+        } else {
+            sys.security.roles.removeItemById(roleId);
+        }
+        msg.isProcessed = true;
+    }
     private static processBodies(msg: Inbound) {
         let bodyId = 0;
         let cbody: Body = null;
@@ -491,25 +670,101 @@ export class ExternalMessage {
                 else if (bodyId === 0) bodyId = 1;
                 else if (bodyId === 3) bodyId = 4;
                 cbody = sys.bodies.getItemById(bodyId);
-                cbody.capacity = msg.extractPayloadByte(3) * 1000;
+                // v1.x only. On v3.004+ this path is unreachable because the Wireless/ICP->OCP
+                // early-return in processIntelliCenter intercepts the 168 (and decodes the BE16
+                // capacity there directly). See ISSUE-073.
+                if (!sys.equipment.isIntellicenterV3) {
+                    cbody.capacity = msg.extractPayloadByte(3) * 1000;
+                }
+                msg.isProcessed = true;
+                break;
+            case 12: // Circuit notifications
+                if (msg.payload.length > 3) {
+                    const value = msg.extractPayloadByte(3, 0);
+                    sys.alerts.circuitNotifications = value;
+                    sys.alerts.setRaw(12, [value]);
+                    if (typeof webApp !== 'undefined' && webApp) webApp.emitToClients('alertConfig', sys.alerts.get(true));
+                }
                 msg.isProcessed = true;
                 break;
             case 13: // Pump notifications
+                ExternalMessage.applyAlertNotificationFromExternal(msg, 13, 3);
                 msg.isProcessed = true;
                 break;
-            case 14: // Heater notifications
+            case 14: // UltraTemp Heater notifications
+                ExternalMessage.applyAlertNotificationFromExternal(msg, 14, 3);
                 msg.isProcessed = true;
                 break;
             case 15: // Chlorinator notifications
+                ExternalMessage.applyAlertNotificationFromExternal(msg, 15, 3);
+                msg.isProcessed = true;
+                break;
+            case 16: // IntelliChem notifications
+                ExternalMessage.applyAlertNotificationFromExternal(msg, 16, 3);
+                msg.isProcessed = true;
+                break;
+            case 17: // Hybrid Heater notifications
+                ExternalMessage.applyAlertNotificationFromExternal(msg, 17, 3);
+                msg.isProcessed = true;
+                break;
+            case 18: // Connected Gas Heater notifications
+                ExternalMessage.applyAlertNotificationFromExternal(msg, 18, 3);
                 msg.isProcessed = true;
                 break;
         }
         state.emitEquipmentChanges();
     }
+    private static applyAlertNotificationFromExternal(msg: Inbound, selector: number, startOffset: number) {
+        const raw: number[] = [];
+        for (let i = startOffset; i < msg.payload.length; i++) raw.push(msg.extractPayloadByte(i, 0));
+        sys.alerts.setRaw(selector, raw);
+        if (raw.length === 0) return;
+        let mask = 0;
+        if (raw.length <= 2) {
+            for (let i = 0; i < raw.length; i++) {
+                mask = (mask << 8) | (raw[i] & 0xFF);
+            }
+        } else {
+            for (let i = 0; i < raw.length; i++) {
+                mask |= (raw[i] & 0xFF) << (i * 8);
+            }
+        }
+        mask = mask >>> 0;
+        switch (selector) {
+            case 13:
+                sys.alerts.pumpNotifications = mask;
+                break;
+            case 14:
+                sys.alerts.ultratempNotifications = mask;
+                break;
+            case 15:
+                sys.alerts.chlorinatorNotifications = mask;
+                break;
+            case 16:
+                sys.alerts.intellichemNotifications = mask;
+                break;
+            case 17:
+                sys.alerts.hybridNotifications = mask;
+                break;
+            case 18:
+                sys.alerts.connectedGasNotifications = mask;
+                break;
+        }
+        if (typeof webApp !== 'undefined' && webApp) webApp.emitToClients('alertConfig', sys.alerts.get(true));
+    }
     private static processSchedules(msg: Inbound) {
         let schedId = msg.extractPayloadByte(2) + 1;
-        let startTime = msg.extractPayloadInt(3);
-        let endTime = msg.extractPayloadInt(5);
+        // v3.004+: schedule times are big-endian (hi,lo) in Action 168 payloads.
+        // v1.x: schedule times are little-endian (lo,hi).
+        let startTime: number;
+        let endTime: number;
+        if (sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3) {
+            startTime = msg.extractPayloadIntBE(3);
+            endTime = msg.extractPayloadIntBE(5);
+        } else {
+            startTime = msg.extractPayloadInt(3);
+            endTime = msg.extractPayloadInt(5);
+        }
         let circuit = msg.extractPayloadByte(7) + 1;
         let isActive = (msg.extractPayloadByte(8) & 128) === 128; // Inactive schedules do not have bit 8 set.
         let cfg = sys.schedules.getItemById(schedId, isActive);
@@ -563,7 +818,59 @@ export class ExternalMessage {
         state.emitEquipmentChanges();
         msg.isProcessed = true;
     }
+    // ISSUE-078: Shared v3.008 Action 168 cat=7 sub=0 decoder. Invoked from two paths:
+    //   (Part B) Wireless → OCP request direction — gives fast live updates between 222 polls.
+    //   (Part D) OCP → broadcast (src=16, dest=15) — keeps decode correct when the OCP
+    //            itself rebroadcasts cat=7 (legacy processChlorinator misreads bytes 7/8 on v3).
+    // 13-byte payload layout confirmed via packetLog(2026-04-19_23-14-52).log:
+    //   [0]=cat 7, [1]=sub 0, [2]=selector (0 for single chlor on i8PS),
+    //   [3]=body (32=shared, 0 observed for "Pool only" — NOT reliable as the active-slot signal),
+    //   [4]=type,
+    //   [5]=poolSetpoint, [6]=spaSetpoint,
+    //   [7]=0, [8]=0,
+    //   [9]=superChlorHours,
+    //   [10]=slot-active flag (1=provisioned). Stayed 1 through body=32→0 toggle.
+    //   [11..12]=cover-closed IntelliChlor outputs per body (Part C / ISSUE-075).
+    // superChlor on-flag location on v3 is NOT yet characterised — deferred to Part C.
+    // Multi-chlor A168 layout (selector != 0) also not characterised; bench is single-chlor i8PS.
+    private static processIntelliCenterV3Chlor168(msg: Inbound) {
+        const chlorId = 1;
+        const slotActive = msg.extractPayloadByte(10, 0) === 1;
+        if (!slotActive) {
+            sys.chlorinators.removeItemById(chlorId);
+            state.chlorinators.removeItemById(chlorId);
+        } else {
+            const c = sys.chlorinators.getItemById(chlorId, true);
+            const sc = state.chlorinators.getItemById(c.id, true);
+            c.isActive = sc.isActive = true;
+            c.master = 0;
+            c.body = msg.extractPayloadByte(3, c.body || 0);
+            c.type = msg.extractPayloadByte(4, c.type);
+            if (!c.disabled && !c.isDosing) {
+                c.poolSetpoint = msg.extractPayloadByte(5);
+                c.spaSetpoint = msg.extractPayloadByte(6);
+            }
+            c.superChlorHours = msg.extractPayloadByte(9);
+            c.address = 80;
+            if (typeof c.name === 'undefined' || c.name === '') c.name = `Chlorinator ${chlorId}`;
+            sc.body = c.body;
+            sc.poolSetpoint = c.poolSetpoint;
+            sc.spaSetpoint = c.spaSetpoint;
+            sc.type = c.type;
+            sc.superChlorHours = c.superChlorHours;
+        }
+        state.emitEquipmentChanges();
+    }
     private static processChlorinator(msg: Inbound) {
+        // ISSUE-078 Part D: on IntelliCenter v3.008 the cat=7 sub=0 Action 168 payload is row-
+        // major stride-9 (see processIntelliCenterV3Chlor168). The legacy decoder below is
+        // column-major stride-4 — its byte offsets for bytes 7/8 misdecode on v3 (clobbering
+        // superChlor/superChlorHours). Any v3 A168 cat=7 that reaches here slipped past the
+        // dedicated v3 routes above; bail out rather than trash state.
+        if (sys.equipment.isIntellicenterV3) {
+            msg.isProcessed = true;
+            return;
+        }
         let isActive = msg.extractPayloadByte(10) > 0;
         let chlorId = msg.extractPayloadByte(2) + 1;
         let cfg = sys.chlorinators.getItemById(chlorId, isActive);
@@ -590,12 +897,39 @@ export class ExternalMessage {
             s.spaSetpoint = cfg.spaSetpoint;
             s.superChlorHours = cfg.superChlorHours;
             s.body = cfg.body;
+
+            // ISSUE-075 #4 / ISSUE-080: cover-menu "IntelliChlor Output" (per-body, not per-cover)
+            // piggybacks on this same A168 cat=7 packet in bytes 11 (Pool, 0-50) and 12 (Spa, 0-10).
+            // Per .plan/v3.008/covers-packet-reference.md §4.2. Assign to whichever cover is
+            // currently bound to each body by cat=14 flags bit 3.
+            if (msg.payload.length > 12) {
+                const poolCoverOutput = msg.extractPayloadByte(11);
+                const spaCoverOutput = msg.extractPayloadByte(12);
+                const poolBodyId = sys.board.valueMaps.bodies.getValue('pool');
+                const spaBodyId = sys.board.valueMaps.bodies.getValue('spa');
+                const covers = sys.covers.get();
+                for (let i = 0; i < covers.length; i++) {
+                    const c: Cover = sys.covers.getItemById(covers[i].id);
+                    if (!c || !c.isActive) continue;
+                    const sc = state.covers.getItemById(c.id, true);
+                    const bodyVal = sys.board.valueMaps.bodies.encode(c.body);
+                    if (bodyVal === poolBodyId) {
+                        c.chlorOutput = poolCoverOutput;
+                        sc.chlorOutput = poolCoverOutput;
+                    } else if (bodyVal === spaBodyId) {
+                        c.chlorOutput = spaCoverOutput;
+                        sc.chlorOutput = spaCoverOutput;
+                    }
+                }
+            }
             msg.isProcessed = true;
         }
         state.emitEquipmentChanges();
     }
     private static processPump(msg: Inbound) {
         let pumpId = msg.extractPayloadByte(2) + 1;
+        const useBigEndian = sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3;
+        const readInt = (ndx: number) => useBigEndian ? msg.extractPayloadIntBE(ndx) : msg.extractPayloadInt(ndx);
         if (msg.extractPayloadByte(1) === 0) {
             let type = msg.extractPayloadByte(3);
             let cpump = sys.pumps.getItemById(pumpId, type > 0);
@@ -603,20 +937,27 @@ export class ExternalMessage {
             cpump.type = type;
             spump.type = type;
             if (cpump.type >= 2) {
-                cpump.address = msg.extractPayloadByte(5);
-                cpump.minSpeed = msg.extractPayloadInt(6);
-                cpump.maxSpeed = msg.extractPayloadInt(8);
+                const ptype = sys.board.valueMaps.pumpTypes.transform(cpump.type);
+                const hasBodyAssociation = ptype.hasBody === true;
+                const circuitStartNdx = hasBodyAssociation ? 19 : 18;
+                if (hasBodyAssociation) {
+                    const decodedBody = ExternalMessage.decodePumpBodyCode(msg.extractPayloadByte(18));
+                    if (typeof decodedBody !== 'undefined') cpump.body = decodedBody;
+                }
+                cpump.address = ExternalMessage.normalizeIntelliCenterPumpAddress(msg.extractPayloadByte(5));
+                cpump.minSpeed = readInt(6);
+                cpump.maxSpeed = readInt(8);
                 cpump.minFlow = msg.extractPayloadByte(10);
                 cpump.maxFlow = msg.extractPayloadByte(11);
                 cpump.flowStepSize = msg.extractPayloadByte(12);
-                cpump.primingSpeed = msg.extractPayloadInt(13);
+                cpump.primingSpeed = readInt(13);
                 cpump.speedStepSize = msg.extractPayloadByte(15) * 10;
                 cpump.primingTime = msg.extractPayloadByte(16);
                 cpump.circuits.clear();
-                for (let i = 18; i < msg.payload.length && i <= 25; i++) {
+                for (let i = circuitStartNdx; i < msg.payload.length && i <= 25; i++) {
                     let circuitId = msg.extractPayloadByte(i);
                     if (circuitId !== 255) {
-                        let circuit = cpump.circuits.getItemById(i - 17, true);
+                        let circuit = cpump.circuits.getItemById(i - (circuitStartNdx - 1), true);
                         circuit.circuit = circuitId + 1;
                         circuit.units = msg.extractPayloadByte(i + 8);
                     }
@@ -624,7 +965,10 @@ export class ExternalMessage {
             }
             else if (cpump.type === 1) {
                 cpump.circuits.clear();
-                cpump.circuits.add({ id: 1, body: msg.extractPayloadByte(18) });
+                const bodyAt10 = ExternalMessage.decodePumpBodyCode(msg.extractPayloadByte(10));
+                const bodyAt18 = ExternalMessage.decodePumpBodyCode(msg.extractPayloadByte(18));
+                const decodedBody = typeof bodyAt10 !== 'undefined' ? bodyAt10 : bodyAt18;
+                if (typeof decodedBody !== 'undefined') cpump.body = decodedBody;
             }
             if (cpump.type === 0) {
                 sys.pumps.removeItemById(cpump.id);
@@ -639,7 +983,7 @@ export class ExternalMessage {
             if (cpump.type > 2) {
                 for (let i = 3, circuitId = 1; i < msg.payload.length && i <= 18; circuitId++) {
                     let circuit = cpump.circuits.getItemById(circuitId);
-                    let sp = msg.extractPayloadInt(i);
+                    let sp = readInt(i);
                     if (sp < 450)
                         circuit.flow = sp;
                     else
@@ -663,11 +1007,19 @@ export class ExternalMessage {
         }
         else {
             feature.freeze = msg.extractPayloadByte(4) > 0;
-            feature.dontStop = msg.extractPayloadByte(8) > 0;
+            fstate.freezeProtect = feature.freeze;
             fstate.name = feature.name = msg.extractPayloadString(9, 16);
             fstate.type = feature.type = type;
-            feature.eggTimer = (msg.extractPayloadByte(6) * 60) + msg.extractPayloadByte(7);
             fstate.showInFeatures = feature.showInFeatures = msg.extractPayloadByte(5) > 0;
+            let hours = msg.extractPayloadByte(6);
+            const isV3 = sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3;
+            if (isV3 && hours >= 24) {
+                feature.dontStop = true;
+                feature.eggTimer = 1440;
+            } else {
+                feature.dontStop = isV3 ? false : msg.extractPayloadByte(8) > 0;
+                feature.eggTimer = (hours * 60) + msg.extractPayloadByte(7);
+            }
         }
         state.emitEquipmentChanges();
         msg.isProcessed = true;
@@ -678,10 +1030,18 @@ export class ExternalMessage {
         let cstate = state.circuits.getItemById(circuitId, false);
         circuit.showInFeatures = msg.extractPayloadByte(5) > 0;
         circuit.freeze = msg.extractPayloadByte(4) > 0;
+        cstate.freezeProtect = circuit.freeze;
         circuit.name = msg.extractPayloadString(10, 16);
         circuit.type = msg.extractPayloadByte(3);
-        circuit.eggTimer = (msg.extractPayloadByte(7) * 60) + msg.extractPayloadByte(8);
-        circuit.showInFeatures = msg.extractPayloadByte(5) > 0;
+        let hours = msg.extractPayloadByte(7);
+        const isV3 = sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3;
+        if (isV3 && hours >= 24) {
+            circuit.dontStop = true;
+            circuit.eggTimer = 1440;
+        } else {
+            if (isV3) circuit.dontStop = false;
+            circuit.eggTimer = (hours * 60) + msg.extractPayloadByte(8);
+        }
         cstate.type = circuit.type;
         cstate.showInFeatures = circuit.showInFeatures;
         cstate.name = circuit.name;
@@ -702,9 +1062,108 @@ export class ExternalMessage {
     }
     private static processTempSettings(msg: Inbound) {
         let fnTranslateByte = (byte: number) => { return (byte & 0x007F) * (((byte & 0x0080) > 0) ? -1 : 1); }
-        // What the developers did is supply an offset index into the payload for the byte that is
-        // changing.  I suppose this may have been easier but we are not using that logic.  We want the
-        // information to remain decoded so that we aren't guessing which byte does what.
+        const decodeFreezeOverride = (raw: number) => raw <= 3 ? (30 + (raw * 60)) : raw;
+        
+        // v3.004+: Wireless sends the FULL options block, not a single-field notification.
+        // v1.x: Used byte[2] as a pivot/index indicating which field changed, then byte[byte[2]+3] = new value.
+        // 
+        // IMPORTANT: v3 Action 168 from Wireless has DIFFERENT offsets than Action 30 type 0!
+        // - Action 30 type 0:    poolHeatNdx=19, spaHeatNdx=21, poolModeNdx=23, spaModeNdx=24
+        // - Action 168 Wireless: poolHeatNdx=20, spaHeatNdx=22, poolModeNdx=24, spaModeNdx=25
+        // The Wireless payload has an extra byte at position 4, shifting everything by +1.
+        const isIntellicenterV3 = (sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3);
+        
+        // Detect v3 full-block format by payload length (v3 sends 41 bytes for msgType 0)
+        if (isIntellicenterV3 && msg.payload.length >= 27) {
+            // v3.004+ Wireless full options block - different offsets than Action 30.
+            // Most captures use offsets [20..25], but some packets include an extra
+            // timestamp-like byte before setpoints, shifting to [21..26].
+            const buildCandidate = (shift: number) => ({
+                shift,
+                poolHeat: msg.extractPayloadByte(20 + shift),
+                poolCool: msg.extractPayloadByte(21 + shift),
+                spaHeat: msg.extractPayloadByte(22 + shift),
+                spaCool: msg.extractPayloadByte(23 + shift),
+                poolMode: msg.extractPayloadByte(24 + shift),
+                spaMode: msg.extractPayloadByte(25 + shift),
+                freezeCycleTime: msg.extractPayloadByte(26 + shift, 255),
+                valveDelay: msg.extractPayloadByte(27 + shift, 255),
+                freezeOverrideRaw: msg.extractPayloadByte(28 + shift, 255),
+                manualPriority: msg.extractPayloadByte(29 + shift, 255)
+            });
+            const scoreCandidate = (c: { poolHeat: number, poolCool: number, spaHeat: number, spaCool: number, poolMode: number, spaMode: number }) => {
+                let score = 0;
+                const isTemp = (v: number) => v > 0 && v <= 120;
+                const isMode = (v: number) => v > 0 && v <= 100;
+                if (isTemp(c.poolHeat)) score += 3;
+                if (isTemp(c.spaHeat)) score += 3;
+                if (isTemp(c.poolCool)) score += 2;
+                if (isTemp(c.spaCool)) score += 2;
+                if (isMode(c.poolMode)) score += 1;
+                if (isMode(c.spaMode)) score += 1;
+                return score;
+            };
+            let selected = buildCandidate(0);
+            if (msg.payload.length >= 27) {
+                const shifted = buildCandidate(1);
+                if (scoreCandidate(shifted) > scoreCandidate(selected)) selected = shifted;
+            }
+            if (selected.shift !== 0) {
+                logger.silly(`v3.004+ Action 168: using shifted temp offsets (+${selected.shift})`);
+            }
+            
+            // Update Body 1 (Pool)
+            let body = sys.bodies.getItemById(1, sys.equipment.maxBodies > 0);
+            let sbody = state.temps.bodies.getItemById(1);
+            if (body.isActive) {
+                const newPoolHeat = selected.poolHeat;
+                const newPoolCool = selected.poolCool;
+                const newPoolMode = selected.poolMode;
+                logger.silly(`v3.004+ Action 168: Pool setpoint ${body.heatSetpoint} → ${newPoolHeat}, coolSetpoint ${body.coolSetpoint} → ${newPoolCool}, mode ${body.heatMode} → ${newPoolMode}`);
+                body.heatSetpoint = newPoolHeat;
+                body.coolSetpoint = newPoolCool;
+                body.heatMode = newPoolMode;
+                sbody.heatSetpoint = body.heatSetpoint;
+                sbody.coolSetpoint = body.coolSetpoint;
+                sbody.heatMode = body.heatMode;
+            }
+            
+            // Update Body 2 (Spa)
+            body = sys.bodies.getItemById(2, sys.equipment.maxBodies > 1);
+            sbody = state.temps.bodies.getItemById(2);
+            if (body.isActive) {
+                const newSpaHeat = selected.spaHeat;
+                const newSpaCool = selected.spaCool;
+                const newSpaMode = selected.spaMode;
+                logger.silly(`v3.004+ Action 168: Spa setpoint ${body.heatSetpoint} → ${newSpaHeat}, coolSetpoint ${body.coolSetpoint} → ${newSpaCool}, mode ${body.heatMode} → ${newSpaMode}`);
+                body.heatSetpoint = newSpaHeat;
+                body.coolSetpoint = newSpaCool;
+                body.heatMode = newSpaMode;
+                sbody.heatSetpoint = body.heatSetpoint;
+                sbody.coolSetpoint = body.coolSetpoint;
+                sbody.heatMode = body.heatMode;
+            }
+            if (selected.freezeCycleTime !== 255) sys.general.options.freezeCycleTime = selected.freezeCycleTime;
+            if (selected.valveDelay !== 255) sys.general.options.valveDelay = selected.valveDelay > 0;
+            if (selected.freezeOverrideRaw !== 255) sys.general.options.freezeOverride = decodeFreezeOverride(selected.freezeOverrideRaw);
+            if (selected.manualPriority !== 255) sys.general.options.manualPriority = selected.manualPriority > 0;
+            const unitsRaw = msg.extractPayloadByte(32 + selected.shift, 255);
+            if (unitsRaw === 0 || unitsRaw === 1) {
+                const mappedUnits = unitsRaw === 1
+                    ? sys.board.valueMaps.tempUnits.getValue('C')
+                    : sys.board.valueMaps.tempUnits.getValue('F');
+                sys.general.options.units = mappedUnits;
+                state.temps.units = mappedUnits;
+                const bodyUnits = mappedUnits === sys.board.valueMaps.tempUnits.getValue('C') ? 2 : 1;
+                for (let i = 0; i < sys.bodies.length; i++) sys.bodies.getItemByIndex(i).capacityUnits = bodyUnits;
+            }
+            
+            state.emitEquipmentChanges();
+            msg.isProcessed = true;
+            return;
+        }
+        
+        // v1.x: Single-field-changed notification using byte[2] as pivot index.
         // payLoadIndex = byte(2) + 3 where the first 3 bytes indicate what value changed.
         let body: Body = null;
         switch (msg.extractPayloadByte(2)) {

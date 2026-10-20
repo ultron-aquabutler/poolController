@@ -1,10 +1,10 @@
 ### Build stage
 # Balena fleets can substitute the base image via --build-arg BASE_IMAGE when
 # they need a balenalib variant (e.g. balenalib/raspberry-pi-base:latest) for
-# tighter OS-level alignment with balenaOS. Default stays upstream node:20-alpine
+# tighter OS-level alignment with balenaOS. Default is upstream's node:22-alpine
 # because balenalib variants are slow to release and serialport ships prebuilt
-# binaries for node-20 linux-arm glibc/alpine.
-ARG BASE_IMAGE=node:20-alpine
+# binaries for node-22 linux-arm glibc/alpine.
+ARG BASE_IMAGE=node:22-alpine
 FROM ${BASE_IMAGE} AS build
 LABEL maintainer="nodejs-poolController"
 LABEL org.opencontainers.image.title="nodejs-poolController"
@@ -44,7 +44,7 @@ RUN npm run build
 RUN npm prune --production
 
 ### Runtime stage
-ARG BASE_IMAGE=node:20-alpine
+ARG BASE_IMAGE=node:22-alpine
 FROM ${BASE_IMAGE} AS prod
 LABEL org.opencontainers.image.title="nodejs-poolController"
 LABEL org.opencontainers.image.description="Bridge Pentair / compatible pool automation equipment to modern interfaces (REST, WebSockets, MQTT, Influx, Rules)."
@@ -64,6 +64,7 @@ RUN mkdir -p /app/logs /app/data /app/backups /app/web/bindings/custom \
 COPY --chown=node:node --from=build /app/package*.json ./
 COPY --chown=node:node --from=build /app/node_modules ./node_modules
 COPY --chown=node:node --from=build /app/dist ./dist
+COPY --chown=node:node --from=build /app/web/bindings ./web/bindings
 COPY --chown=node:node --from=build /app/defaultConfig.json ./defaultConfig.json
 COPY --chown=node:node --from=build /app/config.json ./config.json
 COPY --chown=node:node --from=build /app/README.md ./README.md

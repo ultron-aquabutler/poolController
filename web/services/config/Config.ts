@@ -31,12 +31,123 @@ import { conn } from "../../../controller/comms/Comms";
 import { webApp, BackupFile, RestoreFile } from "../../Server";
 import { release } from "os";
 import { ScreenLogicComms, sl } from "../../../controller/comms/ScreenLogic";
+import { IntelliCenterWSComms, icws } from "../../../controller/comms/IntelliCenterWS";
 import { screenlogic } from "node-screenlogic";
 
 export class ConfigRoute {
+    private static securitySessions: Map<string, any> = new Map<string, any>();
+    private static isOcpWriteSecurityEnforced(): boolean {
+        // Intentionally hard-disabled until OCP security semantics are fully understood.
+        // This avoids accidentally locking users out of configuration writes.
+        return false;
+    }
+    private static getClientKey(req: express.Request): string {
+        const forwarded = (req.headers['x-forwarded-for'] || '') as string;
+        const forwardedIp = forwarded.split(',')[0].trim();
+        const connIp = ((req.connection as any) || {}).remoteAddress || '';
+        return forwardedIp || req.ip || connIp || 'unknown';
+    }
+    private static getSecuritySession(req: express.Request): any {
+        const key = ConfigRoute.getClientKey(req);
+        return ConfigRoute.securitySessions.get(key);
+    }
+    private static clearSecuritySession(req: express.Request): any {
+        const key = ConfigRoute.getClientKey(req);
+        ConfigRoute.securitySessions.delete(key);
+        return {
+            isAuthenticated: false,
+            isAdmin: false,
+            roleId: 0,
+            roleName: '',
+            ip: key
+        };
+    }
+    private static createSecuritySession(req: express.Request, role: any): any {
+        const key = ConfigRoute.getClientKey(req);
+        const session = {
+            isAuthenticated: true,
+            isAdmin: role.id === 1 || typeof role.name === 'string' && role.name.toLowerCase().indexOf('admin') >= 0,
+            roleId: role.id || 0,
+            roleName: role.name || '',
+            permissionsMask: role.permissionsMask || 0,
+            timeout: role.timeout || 5,
+            ip: key,
+            updatedAt: new Date().toISOString()
+        };
+        ConfigRoute.securitySessions.set(key, session);
+        return session;
+    }
+    private static getRoleForPin(pin: string): any {
+        const normalizedPin = (pin || '').toString().replace(/\D/g, '');
+        if (normalizedPin.length === 0) return undefined;
+        const roles = sys.security.roles.toArray();
+        for (let i = 0; i < roles.length; i++) {
+            const rolePin = ((roles[i] as any).pin || '').toString().replace(/\D/g, '');
+            if (rolePin.length > 0 && rolePin === normalizedPin) return roles[i];
+        }
+        return undefined;
+    }
+    private static validateWriteAccess(req: express.Request): { allowed: boolean; reason?: string; session?: any } {
+        if (!ConfigRoute.isOcpWriteSecurityEnforced()) return { allowed: true };
+        if (!sys.security.enabled) return { allowed: true };
+        const session = ConfigRoute.getSecuritySession(req);
+        if (typeof session === 'undefined' || !session.isAuthenticated) {
+            return { allowed: false, reason: 'Security is enabled; log in with a PIN to change configuration.' };
+        }
+        if (session.permissionsMask === 0 && !session.isAdmin) {
+            return { allowed: false, reason: 'Guest sessions are read-only.' };
+        }
+        return { allowed: true, session: session };
+    }
+    private static getSessionResponse(req: express.Request): any {
+        const session = ConfigRoute.getSecuritySession(req);
+        const guestEnabled = sys.security.guestEnabled;
+        let guestPermissionsMask = 0;
+        if (guestEnabled) {
+            const roles = sys.security.roles.toArray();
+            const guest = roles.find((r: any) => r.id === 9 || (typeof r.name === 'string' && r.name.toLowerCase() === 'guest'));
+            if (guest) guestPermissionsMask = (guest as any).permissionsMask || 0;
+        }
+        return {
+            enabled: sys.security.enabled,
+            guestEnabled: guestEnabled,
+            guestPermissionsMask: guestPermissionsMask,
+            session: typeof session === 'undefined' ? {
+                isAuthenticated: false,
+                isAdmin: false,
+                roleId: 0,
+                roleName: '',
+                permissionsMask: 0,
+                timeout: 5,
+                ip: ConfigRoute.getClientKey(req)
+            } : session
+        };
+    }
     public static initRoutes(app: express.Application) {
+        app.use('/config', (req, res, next) => {
+            const method = (req.method || '').toUpperCase();
+            if (method !== 'PUT' && method !== 'POST' && method !== 'DELETE') return next();
+            const reqPath = req.path || req.url || '';
+            if (
+                reqPath.startsWith('/security/login') ||
+                reqPath.startsWith('/security/logout') ||
+                reqPath.startsWith('/security/session')
+            ) {
+                return next();
+            }
+            const access = ConfigRoute.validateWriteAccess(req);
+            if (access.allowed) return next();
+            return res.status(403).send({
+                error: 'FORBIDDEN',
+                message: access.reason,
+                security: ConfigRoute.getSessionResponse(req)
+            });
+        });
         app.get('/config/body/:body/heatModes', (req, res) => {
             return res.status(200).send(sys.bodies.getItemById(parseInt(req.params.body, 10)).getHeatModes());
+        });
+        app.get('/v2/config/body/:body/heatModes', (req, res) => {
+            return res.status(200).send(sys.board.bodies.getHeatModesV2(parseInt(req.params.body, 10)));
         });
         app.get('/config/circuit/names', (req, res) => {
             let circuitNames = sys.board.circuits.getCircuitNames();
@@ -65,9 +176,71 @@ export class ConfigRoute {
             };
             return res.status(200).send(opts);
         });
+        app.get('/config/options/security', (req, res) => {
+            let sec = sys.security.get(true);
+            let roles = (sec.roles || []).filter((r: any) => {
+                if (r.id === 1) return true;
+                if (!sys.security.enabled) return false;
+                if (r.id === 9 && !sys.security.guestEnabled) return false;
+                return true;
+            });
+            return res.status(200).send({
+                security: { ...sec, roles: roles },
+                session: ConfigRoute.getSessionResponse(req).session
+            });
+        });
+        app.get('/config/options/remotes', (req, res) => {
+            let circuits = sys.board.circuits.getCircuitReferences(true, true, false, true);
+            let remoteVirtuals = [
+                { id: 237, name: 'Heat Boost' },
+                { id: 238, name: 'Heat Enable' },
+                { id: 239, name: 'Pump Speed +' },
+                { id: 240, name: 'Pump Speed -' },
+                { id: 253, name: 'Pool Heat Enable' },
+                { id: 254, name: 'All Lights On' },
+                { id: 255, name: 'All Lights Off' }
+            ];
+            for (let i = 0; i < remoteVirtuals.length; i++) {
+                circuits.push({ id: remoteVirtuals[i].id, name: remoteVirtuals[i].name, equipmentType: 'virtual' });
+            }
+            circuits.sort((a, b) => a.id - b.id);
+            let opts = {
+                maxRemotes: sys.equipment.maxRemotes,
+                remoteTypes: sys.board.valueMaps.remoteTypes.toArray(),
+                circuits: circuits,
+                pumps: sys.pumps.get().filter(p => p.isActive),
+                bodies: sys.bodies.get().map((b, i) => ({ val: i, desc: b.name })),
+                remotes: sys.remotes.get()
+            };
+            return res.status(200).send(opts);
+        });
+        app.put('/config/remote', async (req, res, next) => {
+            try { res.status(200).send(await sys.board.remotes.setRemoteAsync(req.body)); }
+            catch (err) { next(err); }
+        });
+        app.put('/config/alerts', async (req, res, next) => {
+            try { res.status(200).send(await (sys.board as any).alerts.setAlertNotificationsAsync(req.body)); }
+            catch (err) { next(err); }
+        });
+        app.get('/config/options/alerts', (req, res) => {
+            return res.status(200).send({
+                alerts: sys.alerts.get(true),
+                definitions: typeof (sys.board as any).getAlertDefinitions === 'function' ? (sys.board as any).getAlertDefinitions() : {},
+                poolOptions: {
+                    cooldownDelay: sys.general.options.cooldownDelay,
+                    heaterStartDelay: sys.general.options.heaterStartDelay,
+                    valveDelayTime: sys.general.options.valveDelayTime,
+                    manualPriority: sys.general.options.manualPriority
+                },
+                runtime: {
+                    chemControllers: state.chemControllers.getExtended(),
+                    chemDosers: state.chemDosers.getExtended()
+                }
+            });
+        });
         app.get('/config/options/rs485', async (req, res, next) => {
             try {
-                let opts = { ports: [], local: [], screenlogic: {} }
+                let opts = { ports: [], local: [], screenlogic: {}, ocpws: {} }
                 let cfg = config.getSection('controller');
                 for (let section in cfg) {
                     if (section.startsWith('comms')) {
@@ -77,43 +250,50 @@ export class ConfigRoute {
                             cport.type = cport.netConnect ? 'netConnect' : cport.mock ? 'mock' : 'local'
                         }
                         if (typeof port !== 'undefined') cport.stats = port.stats;
-                        if (port.portId === 0 && port.type === 'screenlogic') {
+                        if (port && port.portId === 0 && port.type === 'screenlogic') {
                             cport.screenlogic.stats = sl.stats;
+                        }
+                        if ((port ? port.portId === 0 : (cport.portId || 0) === 0) && cport.type === 'ocpws') {
+                            cport.ocpws = extend(true, { host: '', port: 6680, alias: '' }, cport.ocpws || {}, { stats: icws.stats });
                         }
                         opts.ports.push(cport);
                     }
-                    // if (section.startsWith('screenlogic')){
-                    //     let screenlogic = cfg[section];
-                    //     screenlogic.types =  [{ val: 'local', name: 'Local', desc: 'Local Screenlogic' }, { val: 'remote', name: 'Remote', desc: 'Remote Screenlogic' }];
-                    //     screenlogic.stats = sl.stats;
-                    //     opts.screenlogic = screenlogic;
-                    // }
                 }
                 opts.local = await conn.getLocalPortsAsync() || [];
                 return res.status(200).send(opts);
             } catch (err) { next(err); }
         });
-        // app.get('/config/options/screenlogic', async (req, res, next) => {
-        //     try {
-        //         let cfg = config.getSection('controller.screenlogic');
-        //         let data = {
-        //             cfg,
-        //             types: [{ val: 'local', name: 'Local', desc: 'Local Screenlogic' }, { val: 'remote', name: 'Remote', desc: 'Remote Screenlogic' }]
-        //         }
-        //         return res.status(200).send(data);
-        //     } catch (err) { next(err); }
-        // });
         app.get('/config/options/screenlogic/search', async (req, res, next) => {
             try {
                 let localUnits = await ScreenLogicComms.searchAsync();
                 return res.status(200).send(localUnits);
             } catch (err) { next(err); }
         });
+        app.get('/config/options/ocpws/search', async (req, res, next) => {
+            try {
+                const timeoutMs = parseInt(req.query?.timeoutMs as string, 10);
+                const found = await IntelliCenterWSComms.searchAsync(isNaN(timeoutMs) ? 4000 : timeoutMs);
+                return res.status(200).send(found);
+            } catch (err) { next(err); }
+        });
+        app.get('/config/options/ocpws/test', async (req, res, next) => {
+            try {
+                const host = (req.query?.host as string || '').trim();
+                const port = parseInt((req.query?.port as string) || '6680', 10) || 6680;
+                if (!host) return res.status(400).send({ ok: false, error: 'host required' });
+                const result = await IntelliCenterWSComms.testAsync(host, port);
+                return res.status(200).send(result);
+            } catch (err) { return res.status(200).send({ ok: false, error: err.message }); }
+        });
+        app.get('/config/options/ocpws/stats', async (req, res, next) => {
+            try { return res.status(200).send(icws.stats); }
+            catch (err) { next(err); }
+        });
         app.get('/config/options/circuits', async (req, res, next) => {
             try {
                 let opts = {
                     maxCircuits: sys.equipment.maxCircuits,
-                    equipmentIds: sys.equipment.equipmentIds.circuits,
+                    equipmentIds: (sys.equipment.equipmentIds || sys.board.equipmentIds).circuits,
                     invalidIds: sys.board.equipmentIds.invalidIds.get(),
                     equipmentNames: sys.board.circuits.getCircuitNames(),
                     functions: sys.board.circuits.getCircuitFunctions(),
@@ -150,7 +330,7 @@ export class ConfigRoute {
             let opts = {
                 maxFeatures: sys.equipment.maxFeatures,
                 invalidIds: sys.board.equipmentIds.invalidIds.get(),
-                equipmentIds: sys.equipment.equipmentIds.features,
+                equipmentIds: (sys.equipment.equipmentIds || sys.board.equipmentIds).features,
                 equipmentNames: sys.board.circuits.getCircuitNames(),
                 functions: sys.board.features.getFeatureFunctions(),
                 features: sys.features.get()
@@ -193,7 +373,7 @@ export class ConfigRoute {
                         vsf: sys.board.valueMaps.pumpVSFModels.toArray(),
                         vssvrs: sys.board.valueMaps.pumpVSSVRSModels.toArray()
                     },
-                    circuits: sys.board.circuits.getCircuitReferences(true, true, true, true),
+                    circuits: sys.board.circuits.getCircuitReferences(true, true, true, true, true),
                     bodies: sys.board.valueMaps.pumpBodies.toArray(),
                     pumps: sys.pumps.get(),
                     servers: await sys.ncp.getREMServers(),
@@ -226,6 +406,9 @@ export class ConfigRoute {
                     bodies: [],
                     eggTimers: sys.eggTimers.get() // needed for *Touch to not overwrite real schedules
                 };
+                // Rebuild heat source/mode valueMaps before fetching per-body lists so
+                // transformByName returns entries with valid `val` fields.
+                sys.board.heaters.updateHeaterServices();
                 // Now get all the body heat sources.
                 for (let i = 0; i < sys.bodies.length; i++) {
                     let body = sys.bodies.getItemByIndex(i);
@@ -236,19 +419,50 @@ export class ConfigRoute {
         });
         app.get('/config/options/heaters', async (req, res, next) => {
             try {
+                // Ensure heat mode/source valueMaps reflect the *current board* before returning picklists.
+                // Without this, startup can expose generic defaults until the first status/config packets arrive.
+                sys.board.heaters.updateHeaterServices();
                 let opts = {
                     tempUnits: sys.board.valueMaps.tempUnits.transform(state.temps.units),
                     bodies: sys.board.bodies.getBodyAssociations(),
                     maxHeaters: sys.equipment.maxHeaters,
                     heaters: sys.heaters.get(),
                     heaterTypes: sys.board.valueMaps.heaterTypes.toArray(),
-                    heatModes: sys.board.valueMaps.heatModes.toArray(),
+                    equipmentMasters: sys.board.valueMaps.equipmentMaster.toArray(),
+                    // Align with `/config/body/:id/heatModes` (body picklist). This ensures any board-specific
+                    // filtering (e.g. IntelliCenter v3 preferred-mode suppression) is reflected consistently.
+                    // Future improvement should return valid modes per body.
+                    heatModes: sys.board.bodies.getHeatModes(1),
                     coolDownDelay: sys.general.options.cooldownDelay,
                     servers: [],
                     rs485ports: await conn.listInstalledPorts()
                 };
                 // We only need the servers data when the controller is a Nixie controller.  We don't need to
                 // wait for this information if we are dealing with an OCP.
+                if (sys.controllerType === ControllerType.Nixie) opts.servers = await sys.ncp.getREMServers();
+                return res.status(200).send(opts);
+            } catch (err) { next(err); }
+        });
+        app.get('/v2/config/options/heaters', async (req, res, next) => {
+            try {
+                sys.board.heaters.updateHeaterServices();
+                let bodyHeatModes = {};
+                for (let i = 0; i < sys.bodies.length; i++) {
+                    let body = sys.bodies.getItemByIndex(i);
+                    bodyHeatModes[body.id] = sys.board.bodies.getHeatModesV2(body.id);
+                }
+                let opts = {
+                    tempUnits: sys.board.valueMaps.tempUnits.transform(state.temps.units),
+                    bodies: sys.board.bodies.getBodyAssociations(),
+                    maxHeaters: sys.equipment.maxHeaters,
+                    heaters: sys.heaters.get(),
+                    heaterTypes: sys.board.valueMaps.heaterTypes.toArray(),
+                    equipmentMasters: sys.board.valueMaps.equipmentMaster.toArray(),
+                    bodyHeatModes: bodyHeatModes,
+                    coolDownDelay: sys.general.options.cooldownDelay,
+                    servers: [],
+                    rs485ports: await conn.listInstalledPorts()
+                };
                 if (sys.controllerType === ControllerType.Nixie) opts.servers = await sys.ncp.getREMServers();
                 return res.status(200).send(opts);
             } catch (err) { next(err); }
@@ -301,6 +515,7 @@ export class ConfigRoute {
                     // waterFlow: sys.board.valueMaps.chemControllerWaterFlow.toArray(), // remove
                     controllers: sys.chemControllers.get(),
                     maxChemControllers: sys.equipment.maxChemControllers,
+                    intellichemStandaloneSupported: sys.controllerType === ControllerType.Nixie,
                     doserTypes: sys.board.valueMaps.chemDoserTypes.toArray(),
                     chlorinators: sys.chlorinators.get(),
                 };
@@ -398,6 +613,39 @@ export class ConfigRoute {
             };
             return res.status(200).send(opts);
         });
+        // ISSUE-075 #6 / ISSUE-080: expose the IntelliCenter cover configuration surface so
+        // dashPanel (or any API consumer) can render the Controllers → Covers page.
+        //
+        // Response shape:
+        //   {
+        //     maxCovers: 2 (IntelliCenter hard-cap: A/D Cover Module part 522039 supports 2),
+        //     bodyOptions: [{ val, name }, ...],          // Pool / Spa valueMap rows
+        //     availableCircuits: [...getCircuitReferences], // picker list for "Affected Circuits"
+        //     covers: [ { id, name, isActive, body, normallyOn, chlorActive, chlorOutput,
+        //                 chlorOutputMax, circuits: [ids], ... } ]
+        //   }
+        //
+        // `chlorOutputMax` is per-body (Pool 0-50, Spa 0-10) — the OCP enforces this; mirroring
+        // it in the API lets dashPanel cap its slider without a second round-trip.
+        app.get('/config/options/covers', (req, res) => {
+            const poolBodyId = sys.board.valueMaps.bodies.getValue('pool');
+            const spaBodyId = sys.board.valueMaps.bodies.getValue('spa');
+            const covers = sys.covers.get().map((c: any) => {
+                const bodyVal = sys.board.valueMaps.bodies.encode(c.body);
+                const chlorOutputMax = bodyVal === spaBodyId ? 10 : 50;
+                return Object.assign({}, c, { chlorOutputMax });
+            });
+            const opts = {
+                maxCovers: 2,
+                bodyOptions: [
+                    { val: poolBodyId, name: 'Pool' },
+                    { val: spaBodyId, name: 'Spa' }
+                ],
+                availableCircuits: sys.board.circuits.getCircuitReferences(true, true, false, false),
+                covers
+            };
+            return res.status(200).send(opts);
+        });
         app.get('/config/options/filters', async (req, res, next) => {
             try {
                 let opts = {
@@ -453,6 +701,93 @@ export class ConfigRoute {
                 // sys.anslq25ControllerType
                 await sys.anslq25Board.setAnslq25Async(req.body);
                 return res.status(200).send(sys.anslq25.get(true));
+            } catch (err) { next(err); }
+        });
+        // Virtual Equipment (wire-level slave simulators: pumps, etc.)
+        // These are NOT in poolConfig/state; they're a separate runtime feature
+        // persisted in data/virtualEquipment.json and controlled purely via REST.
+        app.get('/config/virtualEquipment', async (req, res, next) => {
+            try {
+                if (!sys.virtualEquipment) return res.status(200).send({ pumps: [] });
+                return res.status(200).send(sys.virtualEquipment.getSnapshot());
+            } catch (err) { next(err); }
+        });
+        app.put('/config/virtualEquipment/pump', async (req, res, next) => {
+            try {
+                if (!sys.virtualEquipment) return res.status(503).send({ error: 'VirtualEquipment not initialized' });
+                const pump = await sys.virtualEquipment.upsertPumpAsync(req.body || {});
+                return res.status(200).send(pump.toSnapshot());
+            } catch (err) { next(err); }
+        });
+        app.delete('/config/virtualEquipment/pump/:address', async (req, res, next) => {
+            try {
+                if (!sys.virtualEquipment) return res.status(503).send({ error: 'VirtualEquipment not initialized' });
+                const address = parseInt(req.params.address, 10);
+                if (!Number.isFinite(address)) return res.status(400).send({ error: 'invalid address' });
+                await sys.virtualEquipment.deletePumpAsync(address);
+                return res.status(200).send(sys.virtualEquipment.getSnapshot());
+            } catch (err) { next(err); }
+        });
+        app.put('/config/virtualEquipment/pump/:address/reenable', async (req, res, next) => {
+            try {
+                if (!sys.virtualEquipment) return res.status(503).send({ error: 'VirtualEquipment not initialized' });
+                const address = parseInt(req.params.address, 10);
+                if (!Number.isFinite(address)) return res.status(400).send({ error: 'invalid address' });
+                const pump = await sys.virtualEquipment.reenablePumpAsync(address);
+                if (!pump) return res.status(404).send({ error: `no virtual pump at address ${address}` });
+                return res.status(200).send(pump.toSnapshot());
+            } catch (err) { next(err); }
+        });
+        app.put('/config/virtualEquipment/chlorinator', async (req, res, next) => {
+            try {
+                if (!sys.virtualEquipment) return res.status(503).send({ error: 'VirtualEquipment not initialized' });
+                const chlor = await sys.virtualEquipment.upsertChlorinatorAsync(req.body || {});
+                return res.status(200).send(chlor.toSnapshot());
+            } catch (err) { next(err); }
+        });
+        app.delete('/config/virtualEquipment/chlorinator/:address', async (req, res, next) => {
+            try {
+                if (!sys.virtualEquipment) return res.status(503).send({ error: 'VirtualEquipment not initialized' });
+                const address = parseInt(req.params.address, 10);
+                if (!Number.isFinite(address)) return res.status(400).send({ error: 'invalid address' });
+                await sys.virtualEquipment.deleteChlorinatorAsync(address);
+                return res.status(200).send(sys.virtualEquipment.getSnapshot());
+            } catch (err) { next(err); }
+        });
+        app.put('/config/virtualEquipment/chlorinator/:address/reenable', async (req, res, next) => {
+            try {
+                if (!sys.virtualEquipment) return res.status(503).send({ error: 'VirtualEquipment not initialized' });
+                const address = parseInt(req.params.address, 10);
+                if (!Number.isFinite(address)) return res.status(400).send({ error: 'invalid address' });
+                const chlor = await sys.virtualEquipment.reenableChlorinatorAsync(address);
+                if (!chlor) return res.status(404).send({ error: `no virtual chlorinator at address ${address}` });
+                return res.status(200).send(chlor.toSnapshot());
+            } catch (err) { next(err); }
+        });
+        app.put('/config/virtualEquipment/intellichem', async (req, res, next) => {
+            try {
+                if (!sys.virtualEquipment) return res.status(503).send({ error: 'VirtualEquipment not initialized' });
+                const ic = await sys.virtualEquipment.upsertIntelliChemAsync(req.body || {});
+                return res.status(200).send(ic.toSnapshot());
+            } catch (err) { next(err); }
+        });
+        app.delete('/config/virtualEquipment/intellichem/:address', async (req, res, next) => {
+            try {
+                if (!sys.virtualEquipment) return res.status(503).send({ error: 'VirtualEquipment not initialized' });
+                const address = parseInt(req.params.address, 10);
+                if (!Number.isFinite(address)) return res.status(400).send({ error: 'invalid address' });
+                await sys.virtualEquipment.deleteIntelliChemAsync(address);
+                return res.status(200).send(sys.virtualEquipment.getSnapshot());
+            } catch (err) { next(err); }
+        });
+        app.put('/config/virtualEquipment/intellichem/:address/reenable', async (req, res, next) => {
+            try {
+                if (!sys.virtualEquipment) return res.status(503).send({ error: 'VirtualEquipment not initialized' });
+                const address = parseInt(req.params.address, 10);
+                if (!Number.isFinite(address)) return res.status(400).send({ error: 'invalid address' });
+                const ic = await sys.virtualEquipment.reenableIntelliChemAsync(address);
+                if (!ic) return res.status(404).send({ error: `no virtual intellichem at address ${address}` });
+                return res.status(200).send(ic.toSnapshot());
             } catch (err) { next(err); }
         });
         app.delete('/config/filter', async (req, res, next) => {
@@ -692,6 +1027,17 @@ export class ConfigRoute {
             }
             catch (err) { next(err); }
         });
+        // ISSUE-075 #7 / ISSUE-080: cover config write path. Body / normallyOn / chlorActive /
+        // chlorOutput / circuits — name is read-only (OCP exposes no rename UI for covers;
+        // see .plan/v3.008/covers-packet-reference.md §4.1). The board implementation is
+        // responsible for enforcing the Pool 0-50 / Spa 0-10 output cap and the 1-cover-per-body
+        // Pentair constraint.
+        app.put('/config/cover', async (req, res, next) => {
+            try {
+                let cover = await sys.board.covers.setCoverAsync(req.body);
+                return res.status(200).send(sys.covers.getItemById(cover.id).get(true));
+            } catch (err) { next(err); }
+        });
 
         /***** END OF ENDPOINTS FOR MODIFYINC THE OUTDOOR CONTROL PANEL SETTINGS *****/
 
@@ -854,6 +1200,42 @@ export class ConfigRoute {
                     sys.board.circuits.setIntelliBriteColors(new LightGroup(grp));
                     return res.status(200).send('OK');
                 }); */
+        app.get('/config/security/session', (req, res) => {
+            return res.status(200).send(ConfigRoute.getSessionResponse(req));
+        });
+        app.put('/config/security/login', (req, res) => {
+            if (!sys.security.enabled) {
+                return res.status(409).send({
+                    error: 'SECURITY_DISABLED',
+                    message: 'Panel security is disabled.',
+                    security: ConfigRoute.getSessionResponse(req)
+                });
+            }
+            const role = ConfigRoute.getRoleForPin(((req.body || {}).pin || '').toString());
+            if (typeof role === 'undefined') {
+                return res.status(401).send({
+                    error: 'INVALID_PIN',
+                    message: 'PIN does not match a configured security role.'
+                });
+            }
+            return res.status(200).send({
+                enabled: sys.security.enabled,
+                session: ConfigRoute.createSecuritySession(req, role)
+            });
+        });
+        app.put('/config/security/logout', (req, res) => {
+            return res.status(200).send({
+                enabled: sys.security.enabled,
+                session: ConfigRoute.clearSecuritySession(req)
+            });
+        });
+        app.put('/config/security/role', async (req, res, next) => {
+            try {
+                let result = await (sys.board as any).setSecurityRoleAsync(req.body);
+                return res.status(200).send(result);
+            }
+            catch (err) { next(err); }
+        });
         app.get('/config', (req, res) => {
             return res.status(200).send(sys.getSection('all'));
         });
@@ -870,6 +1252,37 @@ export class ConfigRoute {
         app.put('/app/logger/clearMessages', (req, res) => {
             logger.clearMessages();
             return res.status(200).send('OK');
+        });
+        app.get('/app/diagnostics/valueMaps', (req, res) => {
+            let maps: any = {};
+            let vm = sys.board.valueMaps;
+            for (let key of Object.getOwnPropertyNames(Object.getPrototypeOf(vm)).concat(Object.getOwnPropertyNames(vm))) {
+                try {
+                    let prop = vm[key];
+                    if (prop && typeof prop.toArray === 'function') {
+                        maps[key] = prop.toArray();
+                    }
+                } catch (_err) { }
+            }
+            return res.status(200).send(maps);
+        });
+        app.get('/app/diagnostics/snapshot', (req, res) => {
+            let maps: any = {};
+            let vm = sys.board.valueMaps;
+            for (let key of Object.getOwnPropertyNames(Object.getPrototypeOf(vm)).concat(Object.getOwnPropertyNames(vm))) {
+                try {
+                    let prop = vm[key];
+                    if (prop && typeof prop.toArray === 'function') {
+                        maps[key] = prop.toArray();
+                    }
+                } catch (_err) { }
+            }
+            return res.status(200).send({
+                capturedAt: new Date().toISOString(),
+                config: sys.getSection('all'),
+                state: state.getState('all'),
+                valueMaps: maps,
+            });
         });
         app.get('/app/messages/broadcast/actions', (req, res) => {
             return res.status(200).send(sys.board.valueMaps.msgBroadcastActions.toArray());
@@ -906,18 +1319,26 @@ export class ConfigRoute {
             }
             catch (err) { next(err); }
         });
-        app.get('/app/config/startPacketCapture', (req, res) => {
-            startPacketCapture(true);
-            return res.status(200).send('OK');
+        app.get('/app/config/startPacketCapture', async (req, res, next) => {
+            try {
+                await startPacketCapture(true);
+                return res.status(200).send('OK');
+            } catch (err) { next(err); }
         });
-        app.get('/app/config/startPacketCaptureWithoutReset', (req, res) => {
-            startPacketCapture(false);
-            return res.status(200).send('OK');
+        app.get('/app/config/startPacketCaptureWithoutReset', async (req, res, next) => {
+            try {
+                await startPacketCapture(false);
+                return res.status(200).send('OK');
+            } catch (err) { next(err); }
         });
         app.get('/app/config/stopPacketCapture', async (req, res, next) => {
             try {
                 let file = await stopPacketCaptureAsync();
-                res.download(file);
+                if (typeof file !== 'string' || file.length === 0 || !fs.existsSync(file)) {
+                    logger.warn(`stopPacketCapture did not produce a valid backup file path`);
+                    return res.status(409).send('Packet capture is not active or no capture file is available.');
+                }
+                return res.download(file);
             }
             catch (err) { next(err); }
         });

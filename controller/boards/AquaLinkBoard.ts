@@ -26,6 +26,16 @@ import { conn } from '../comms/Comms';
 import { ncp } from "../nixie/Nixie";
 import { utils } from '../Constants';
 
+const IAQUALINK_SENDCMD_DEST = 0x00;
+const IAQUALINK_SENDCMD_SOURCE = 0x24;
+const IAQUALINK_SENDCMD_ACTION = 0x73;
+const IAQUALINK_SENDCMD_PREFIX = 0x01;
+const IAQUALINK_SENDCMD_PAYLOAD_LEN = 12;
+const IAQUALINK_OPCODE_THEME = 0x61;
+const IAQUALINK_OPCODE_RGB = 0x63;
+const IAQUALINK_OPCODE_SYNC = 0x65;
+const IAQUALINK_WATERCOLORS_CIRCUIT_TYPE = 18;
+
 export class AquaLinkBoard extends SystemBoard {
     constructor(system: PoolSystem) {
         super(system);
@@ -40,6 +50,32 @@ export class AquaLinkBoard extends SystemBoard {
             [5, { name: 'IT10D', part: 'i10D', desc: 'IntelliTouch i10D', circuits: 10, shared: false, dual: true }],
             [32, { name: 'IT5X', part: 'i5X', desc: 'IntelliTouch i5X', circuits: 5 }],
             [33, { name: 'IT10X', part: 'i10X', desc: 'IntelliTouch i10X', circuits: 10 }]
+        ]);
+        this.valueMaps.circuitFunctions.merge([
+            [IAQUALINK_WATERCOLORS_CIRCUIT_TYPE, {
+                name: 'watercolors',
+                desc: 'Infinite WaterColors',
+                isLight: true,
+                theme: 'watercolors',
+                supportsBrightness: true,
+                supportsCustomColor: true
+            }]
+        ]);
+        this.valueMaps.lightThemes.merge([
+            [56, { name: 'alpinewhite', desc: 'Alpine White', types: ['watercolors'], sequence: 1 }],
+            [57, { name: 'skyblue', desc: 'Sky Blue', types: ['watercolors'], sequence: 2 }],
+            [58, { name: 'cobaltblue', desc: 'Cobalt Blue', types: ['watercolors'], sequence: 3 }],
+            [59, { name: 'caribbeanblue', desc: 'Caribbean Blue', types: ['watercolors'], sequence: 4 }],
+            [60, { name: 'springgreen', desc: 'Spring Green', types: ['watercolors'], sequence: 5 }],
+            [61, { name: 'emeraldgreen', desc: 'Emerald Green', types: ['watercolors'], sequence: 6 }],
+            [62, { name: 'emeraldrose', desc: 'Emerald Rose', types: ['watercolors'], sequence: 7 }],
+            [63, { name: 'magenta', desc: 'Magenta', types: ['watercolors'], sequence: 8 }],
+            [64, { name: 'violet', desc: 'Violet', types: ['watercolors'], sequence: 9 }],
+            [65, { name: 'slowcolorsplash', desc: 'Slow Color Splash', types: ['watercolors'], sequence: 10 }],
+            [66, { name: 'fastcolorsplash', desc: 'Fast Color Splash', types: ['watercolors'], sequence: 11 }],
+            [67, { name: 'americathebeautiful', desc: 'America Beautiful', types: ['watercolors'], sequence: 12 }],
+            [68, { name: 'fattuesday', desc: 'Fat Tuesday', types: ['watercolors'], sequence: 13 }],
+            [69, { name: 'discotech', desc: 'Disco Tech', types: ['watercolors'], sequence: 14 }]
         ]);
     }
     public initExpansionModules(byte1: number, byte2: number) {
@@ -187,7 +223,7 @@ class AquaLinkScheduleCommands extends ScheduleCommands {
 
 
         // If we have sunrise/sunset then adjust for the values; if heliotrope isn't set just ignore
-        if (state.heliotrope.isCalculated) {
+        if (state.heliotrope.isCalculated && state.heliotrope.sunrise && state.heliotrope.sunset) {
             const sunrise = state.heliotrope.sunrise.getHours() * 60 + state.heliotrope.sunrise.getMinutes();
             const sunset = state.heliotrope.sunset.getHours() * 60 + state.heliotrope.sunset.getMinutes();
             if (startTimeType === sys.board.valueMaps.scheduleTimeTypes.getValue('sunrise')) startTime = sunrise;
@@ -401,6 +437,59 @@ class AquaLinkBodyCommands extends BodyCommands {
     }
 }
 class AquaLinkCircuitCommands extends CircuitCommands {
+    private isWaterColorsCircuit(circuit: ICircuit): boolean {
+        const type = sys.board.valueMaps.circuitFunctions.transform(circuit.type);
+        return typeof type !== 'undefined' && type.isLight === true && type.theme === 'watercolors';
+    }
+    private getWaterColorsTheme(theme: number | any) {
+        const thm = sys.board.valueMaps.lightThemes.findItem(theme);
+        if (typeof thm === 'undefined' || !Array.isArray(thm.types) || !thm.types.includes('watercolors')) {
+            throw new InvalidOperationError(`Theme ${theme} is not valid for Infinite WaterColors`, 'setLightThemeAsync');
+        }
+        return thm;
+    }
+    private normalizeWaterColorsBrightness(level: number): number {
+        const parsed = parseInt(level as any, 10);
+        if (isNaN(parsed) || parsed < 0 || parsed > 100) {
+            throw new InvalidEquipmentDataError(`Invalid WaterColors brightness ${level}`, 'Circuit', level);
+        }
+        return parsed;
+    }
+    private normalizeWaterColorsComponent(value: number, component: string): number {
+        const parsed = parseInt(value as any, 10);
+        if (isNaN(parsed) || parsed < 0 || parsed > 255) {
+            throw new InvalidEquipmentDataError(`Invalid WaterColors ${component} component ${value}`, 'Circuit', value);
+        }
+        return parsed;
+    }
+    private async sendIAquaLinkLightCommandAsync(opcode: number, payload: number[], scope: string): Promise<void> {
+        const cmdPayload = payload.slice(0, IAQUALINK_SENDCMD_PAYLOAD_LEN);
+        while (cmdPayload.length < IAQUALINK_SENDCMD_PAYLOAD_LEN) cmdPayload.push(0);
+        await Outbound.create({
+            protocol: Protocol.AquaLink,
+            dest: IAQUALINK_SENDCMD_DEST,
+            source: IAQUALINK_SENDCMD_SOURCE,
+            action: IAQUALINK_SENDCMD_ACTION,
+            payload: [IAQUALINK_SENDCMD_PREFIX, opcode, ...cmdPayload],
+            retries: 2,
+            scope
+        }).sendAsync();
+    }
+    private async sendWaterColorsOnCommandAsync(id: number): Promise<void> {
+        await this.sendIAquaLinkLightCommandAsync(IAQUALINK_OPCODE_SYNC, [0x01, 0x00], `aqualink-watercolors-on-${id}`);
+    }
+    private async sendWaterColorsOffCommandAsync(id: number): Promise<void> {
+        await this.sendIAquaLinkLightCommandAsync(IAQUALINK_OPCODE_THEME, [0x00, 0xFF, 0x00], `aqualink-watercolors-off-${id}`);
+    }
+    private setWaterColorsState(circuit: ICircuit, cstate: any, isOn: boolean): void {
+        sys.board.circuits.setEndTime(circuit, cstate, isOn);
+        cstate.isOn = isOn;
+    }
+    private getWaterColorsLevel(circuit: ICircuit, cstate: any): number {
+        if (typeof circuit.level !== 'undefined' && circuit.level > 0) return circuit.level;
+        if (typeof cstate.level !== 'undefined' && cstate.level > 0) return cstate.level;
+        return 100;
+    }
     public async setCircuitAsync(data: any): Promise<ICircuit> {
         try {
             let id = parseInt(data.id, 10);
@@ -413,6 +502,7 @@ class AquaLinkCircuitCommands extends CircuitCommands {
                 return circ;
             }
             let typeByte = parseInt(data.type, 10) || circuit.type || sys.board.valueMaps.circuitFunctions.getValue('generic');
+            this.assertSinglePoolSpaType(id, typeByte);
             let nameByte = 3; // set default `Aux 1`
             if (typeof data.nameId !== 'undefined') nameByte = data.nameId;
             else if (typeof circuit.name !== 'undefined') nameByte = circuit.nameId;
@@ -445,6 +535,19 @@ class AquaLinkCircuitCommands extends CircuitCommands {
         if (isNaN(id)) return Promise.reject(new InvalidEquipmentIdError('Circuit or Feature id not valid', id, 'Circuit'));
         let c = sys.circuits.getInterfaceById(id);
         if (c.master !== 0) return await super.setCircuitStateAsync(id, val);
+        if (this.isWaterColorsCircuit(c)) {
+            const cstate = state.circuits.getInterfaceById(id);
+            if (val) await this.sendWaterColorsOnCommandAsync(id);
+            else await this.sendWaterColorsOffCommandAsync(id);
+            this.setWaterColorsState(c, cstate, val);
+            if (val) {
+                const level = this.getWaterColorsLevel(c, cstate);
+                c.level = level;
+                cstate.level = level;
+            }
+            state.emitEquipmentChanges();
+            return cstate;
+        }
         if (id === 192 || c.type === 3) return await sys.board.circuits.setLightGroupThemeAsync(id - 191, val ? 1 : 0);
         if (id >= 192) return await sys.board.circuits.setCircuitGroupStateAsync(id, val);
 
@@ -507,8 +610,77 @@ class AquaLinkCircuitCommands extends CircuitCommands {
         });
     }
     public async setLightThemeAsync(id: number, theme: number): Promise<ICircuitState> {
-        // Re-route this as we cannot set individual circuit themes in *Touch.
-        return this.setLightGroupThemeAsync(id, theme);
+        const circ = sys.circuits.getItemById(id);
+        if (!this.isWaterColorsCircuit(circ)) {
+            // Re-route this as we cannot set individual circuit themes in *Touch.
+            return this.setLightGroupThemeAsync(id, theme);
+        }
+        const cstate = state.circuits.getItemById(id);
+        const thm = this.getWaterColorsTheme(theme);
+        const nop = sys.board.valueMaps.circuitActions.getValue('lighttheme');
+        cstate.action = nop;
+        cstate.emitEquipmentChange();
+        try {
+            if (!cstate.isOn) await this.sendWaterColorsOnCommandAsync(id);
+            await this.sendIAquaLinkLightCommandAsync(IAQUALINK_OPCODE_THEME, [0x00, thm.sequence, 0x64], `aqualink-watercolors-theme-${id}`);
+            this.setWaterColorsState(circ, cstate, true);
+            const level = this.getWaterColorsLevel(circ, cstate);
+            circ.level = level;
+            cstate.level = level;
+            circ.lightingTheme = thm.val;
+            cstate.lightingTheme = thm.val;
+            cstate.color = undefined;
+            state.emitEquipmentChanges();
+            return cstate;
+        }
+        catch (err) { return Promise.reject(new InvalidOperationError(err.message, 'setLightThemeAsync')); }
+        finally { cstate.action = 0; cstate.emitEquipmentChange(); }
+    }
+    public async setDimmerLevelAsync(id: number, level: number): Promise<ICircuitState> {
+        const circ = sys.circuits.getItemById(id);
+        if (!this.isWaterColorsCircuit(circ)) return super.setDimmerLevelAsync(id, level);
+        const cstate = state.circuits.getItemById(id);
+        const brightness = this.normalizeWaterColorsBrightness(level);
+        const nop = sys.board.valueMaps.circuitActions.getValue('lighttheme');
+        cstate.action = nop;
+        cstate.emitEquipmentChange();
+        try {
+            if (brightness > 0 && !cstate.isOn) await this.sendWaterColorsOnCommandAsync(id);
+            await this.sendIAquaLinkLightCommandAsync(IAQUALINK_OPCODE_THEME, [0x00, 0xFF, brightness], `aqualink-watercolors-brightness-${id}`);
+            circ.level = brightness;
+            cstate.level = brightness;
+            this.setWaterColorsState(circ, cstate, brightness > 0);
+            state.emitEquipmentChanges();
+            return cstate;
+        }
+        catch (err) { return Promise.reject(new InvalidOperationError(err.message, 'setDimmerLevelAsync')); }
+        finally { cstate.action = 0; cstate.emitEquipmentChange(); }
+    }
+    public async setLightColorAsync(id: number, color: { red: number; green: number; blue: number }): Promise<ICircuitState> {
+        const circ = sys.circuits.getItemById(id);
+        if (!this.isWaterColorsCircuit(circ)) return super.setLightColorAsync(id, color);
+        const cstate = state.circuits.getItemById(id);
+        const red = this.normalizeWaterColorsComponent(color.red, 'red');
+        const green = this.normalizeWaterColorsComponent(color.green, 'green');
+        const blue = this.normalizeWaterColorsComponent(color.blue, 'blue');
+        const nop = sys.board.valueMaps.circuitActions.getValue('lighttheme');
+        cstate.action = nop;
+        cstate.emitEquipmentChange();
+        try {
+            if (!cstate.isOn) await this.sendWaterColorsOnCommandAsync(id);
+            await this.sendIAquaLinkLightCommandAsync(IAQUALINK_OPCODE_RGB, [0x00, red, green, blue, 0x00], `aqualink-watercolors-rgb-${id}`);
+            const level = this.getWaterColorsLevel(circ, cstate);
+            circ.level = level;
+            cstate.level = level;
+            this.setWaterColorsState(circ, cstate, true);
+            circ.lightingTheme = sys.board.valueMaps.lightThemes.getValue('none');
+            cstate.lightingTheme = sys.board.valueMaps.lightThemes.getValue('none');
+            cstate.color = { red, green, blue };
+            state.emitEquipmentChanges();
+            return cstate;
+        }
+        catch (err) { return Promise.reject(new InvalidOperationError(err.message, 'setLightColorAsync')); }
+        finally { cstate.action = 0; cstate.emitEquipmentChange(); }
     }
     public async runLightGroupCommandAsync(obj: any): Promise<ICircuitState> {
         // Do all our validation.

@@ -13,7 +13,8 @@
         "allowJs": false,
         "allowSyntheticDefaultImports": false,
         "esModuleInterop": false,
-        "jsx": "react"
+        "jsx": "react",
+        "skipLibCheck": true
     },
     "include": [
         "web/**/*",

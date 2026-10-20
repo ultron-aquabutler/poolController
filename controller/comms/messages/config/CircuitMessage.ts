@@ -213,9 +213,17 @@ export class CircuitMessage {
         let circuitId = sys.board.equipmentIds.circuits.start;
         // With single body systems we have a funny scenario where circuit 1 is just ignored.
         let maxCircuitId = sys.board.equipmentIds.circuits.end;
+        const isV3 = sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3;
         for (let i = circuitId + 1; i < msg.payload.length && circuitId <= maxCircuitId; i++) {
             let circuit: Circuit = sys.circuits.getItemById(circuitId++, true);
-            circuit.eggTimer = msg.extractPayloadByte(i) * 60 + (circuit.eggTimer || 0) % 60;
+            let hours = msg.extractPayloadByte(i);
+            if (isV3 && hours >= 24) {
+                circuit.dontStop = true;
+                circuit.eggTimer = 1440;
+            } else {
+                if (isV3) circuit.dontStop = false;
+                circuit.eggTimer = hours * 60 + (circuit.eggTimer || 0) % 60;
+            }
         }
         msg.isProcessed = true;
     }
@@ -230,6 +238,12 @@ export class CircuitMessage {
         msg.isProcessed = true;
     }
     private static processDontStop(msg: Inbound) {
+        // v3.008+ encodes dontStop as eggTimer hours=24 (sub=27); sub=29 bytes are always 0.
+        // Skip processing to avoid overwriting dontStop set by processEggTimerHours.
+        if (sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3) {
+            msg.isProcessed = true;
+            return;
+        }
         let circuitId = sys.board.equipmentIds.circuits.start;
         // With single body systems we have a funny scenario where circuit 1 is just ignored.
         let maxCircuitId = sys.board.equipmentIds.circuits.end;

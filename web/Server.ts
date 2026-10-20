@@ -642,6 +642,24 @@ export class HttpServer extends ProtoServer {
         this.app.use('/socket.io-client', express.static(path.join(process.cwd(), '/node_modules/socket.io-client/dist/'), { maxAge: '60d' }));
     }
 
+    private replayInboundMessage(mdata: any) {
+        try {
+            let msg: Inbound = new Inbound();
+            if (typeof mdata.direction !== 'undefined') msg.direction = mdata.direction;
+            msg.header = mdata.header;
+            msg.payload = mdata.payload;
+            msg.preamble = mdata.preamble;
+            msg.protocol = mdata.protocol;
+            msg.term = mdata.term;
+            if (typeof mdata.portId === 'number') msg.portId = mdata.portId;
+            msg.scope = 'replay';
+            if (msg.isValid) msg.process();
+        }
+        catch (err) {
+            logger.error(`Error replaying packet: ${err.message}`);
+        }
+    }
+
     private socketHandler(sock: Socket) {
         let self = this;
         // this._sockets.push(sock);
@@ -666,37 +684,24 @@ export class HttpServer extends ProtoServer {
             conn.queueSendMessage(msg);
         });
         sock.on('sendInboundMessage', (mdata) => {
-            try {
-
-                let msg: Inbound = new Inbound();
-                msg.direction = mdata.direction;
-                msg.header = mdata.header;
-                msg.payload = mdata.payload;
-                msg.preamble = mdata.preamble;
-                msg.protocol = mdata.protocol;
-                msg.term = mdata.term;
-                if (msg.isValid) msg.process();
-            }
-            catch (err){
-                logger.error(`Error replaying packet: ${err.message}`);
-            }
+            this.replayInboundMessage(mdata);
         });
         sock.on('rawbytes', (data:any)=>{
             let port = conn.findPortById(0);
             port.pushIn(Buffer.from(data));
         })
         sock.on('sendLogMessages', function (sendMessages: boolean) {
-            console.log(`sendLogMessages set to ${sendMessages}`);
+            logger.silly(`sendLogMessages set to ${sendMessages}`);
             if (!sendMessages) sock.leave('msgLogger');
             else sock.join('msgLogger');
         });
         sock.on('sendRS485PortStats', function (sendPortStats: boolean) {
-            console.log(`sendRS485PortStats set to ${sendPortStats}`);
+            logger.silly(`sendRS485PortStats set to ${sendPortStats}`);
             if (!sendPortStats) sock.leave('rs485PortStats');
             else sock.join('rs485PortStats');
         });
         sock.on('sendScreenlogicStats', function (sendScreenlogicStats: boolean) {
-            console.log(`sendScreenlogicStats set to ${sendScreenlogicStats}`);
+            logger.silly(`sendScreenlogicStats set to ${sendScreenlogicStats}`);
             if (!sendScreenlogicStats) sock.leave('screenlogicStats');
             else sock.join('screenlogicStats');
         });
@@ -713,8 +718,8 @@ export class HttpServer extends ProtoServer {
                 this.server = http.createServer(this.app);
                 if (cfg.httpsRedirect) {
                     var cfgHttps = config.getSection('web').server.https;
-                    this.app.get('*', (res: express.Response, req: express.Request) => {
-                        let host = res.get('host');
+                    this.app.get('/*', (req: express.Request, res: express.Response) => {
+                        let host = req.get('host');
                         // Only append a port if there is one declared.  This will be the case for urls that have have an implicit port.
                         host = host.replace(/:\d+$/, typeof cfgHttps.port !== 'undefined' ? ':' + cfgHttps.port : '');
                         return res.redirect('https://' + host + req.url);
@@ -752,6 +757,13 @@ export class HttpServer extends ProtoServer {
                         }
                         next();
                     }
+                });
+
+                // Minimal inbound replay endpoint for local testing/tools.
+                // Expected JSON shape: { direction, protocol, preamble, header, payload, term }
+                this.app.post('/replay/inbound', (req, res) => {
+                    this.replayInboundMessage(req.body);
+                    res.status(200).send('Inbound message replayed.');
                 });
 
 

@@ -16,6 +16,7 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 import { Inbound } from "../Messages";
+import { ControllerType } from "../../../Constants";
 import { sys, Feature } from "../../../Equipment";
 import { state, FeatureState } from "../../../State";
 import { logger } from "../../../../logger/Logger";
@@ -67,6 +68,12 @@ export class FeatureMessage {
         }
     }
     private static processDontStop(msg: Inbound) {
+        // v3.008+ encodes dontStop as eggTimer hours=24 (sub=3); sub=5 bytes are always 0.
+        // Skip processing to avoid overwriting dontStop set by processEggTimerHours.
+        if (sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3) {
+            msg.isProcessed = true;
+            return;
+        }
         for (let i = 1; i < msg.payload.length - 1 && i <= sys.equipment.maxFeatures; i++) {
             let featureId = i + sys.board.equipmentIds.features.start - 1;
             var feature: Feature = sys.features.getItemById(featureId, false);
@@ -96,48 +103,69 @@ export class FeatureMessage {
     private static processFreezeProtect(msg: Inbound) {
         for (let i = 1; i < msg.payload.length - 1 && i <= sys.equipment.maxFeatures; i++) {
             let featureId = i + sys.board.equipmentIds.features.start - 1;
-            var feature: Feature = sys.features.getItemById(featureId);
-            feature.freeze = msg.extractPayloadByte(i + 1) > 0;
+            var feature: Feature = sys.features.getItemById(featureId, false, { isActive: false });
+            if (feature.isActive !== false) {
+                feature.freeze = msg.extractPayloadByte(i + 1) > 0;
+                state.features.getItemById(featureId, true).freezeProtect = feature.freeze;
+            }
         }
         msg.isProcessed = true;
     }
     private static processFeatureNames(msg: Inbound) {
         var featureId = ((msg.extractPayloadByte(1) - 6) * 2) + sys.board.equipmentIds.features.start;
         if (sys.board.equipmentIds.features.isInRange(featureId)) {
-            let feature: Feature = sys.features.getItemById(featureId++);
-            feature.name = msg.extractPayloadString(2, 16);
-            if (feature.isActive) state.features.getItemById(feature.id).name = feature.name;
+            let feature: Feature = sys.features.getItemById(featureId++, false, { isActive: false });
+            if (feature.isActive !== false) {
+                feature.name = msg.extractPayloadString(2, 16);
+                state.features.getItemById(feature.id, true).name = feature.name;
+            }
         }
         if (sys.board.equipmentIds.features.isInRange(featureId)) {
-            let feature: Feature = sys.features.getItemById(featureId++);
-            feature.name = msg.extractPayloadString(18, 16);
-            if (feature.isActive) state.features.getItemById(feature.id).name = feature.name;
+            let feature: Feature = sys.features.getItemById(featureId++, false, { isActive: false });
+            if (feature.isActive !== false) {
+                feature.name = msg.extractPayloadString(18, 16);
+                state.features.getItemById(feature.id, true).name = feature.name;
+            }
         }
         state.emitEquipmentChanges();
         msg.isProcessed = true;
     }
     private static processEggTimerHours(msg: Inbound) {
+        const isV3 = sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3;
         for (let i = 1; i < msg.payload.length - 1 && i <= sys.equipment.maxFeatures; i++) {
             let featureId = i + sys.board.equipmentIds.features.start - 1;
-            let feature: Feature = sys.features.getItemById(featureId);
-            feature.eggTimer = (msg.extractPayloadByte(i + 1) * 60) + ((feature.eggTimer || 0) % 60);
+            let feature: Feature = sys.features.getItemById(featureId, false, { isActive: false });
+            if (feature.isActive !== false) {
+                let hours = msg.extractPayloadByte(i + 1);
+                if (isV3 && hours >= 24) {
+                    feature.dontStop = true;
+                    feature.eggTimer = 1440;
+                } else {
+                    if (isV3) feature.dontStop = false;
+                    feature.eggTimer = (hours * 60) + ((feature.eggTimer || 0) % 60);
+                }
+            }
         }
         msg.isProcessed = true;
     }
     private static processEggTimerMinutes(msg: Inbound) {
         for (let i = 1; i < msg.payload.length - 1 && i <= sys.equipment.maxFeatures; i++) {
             let featureId = i + sys.board.equipmentIds.features.start - 1;
-            var feature: Feature = sys.features.getItemById(featureId);
-            feature.eggTimer = (Math.floor(feature.eggTimer / 60) * 60) + msg.extractPayloadByte(i + 1);
+            var feature: Feature = sys.features.getItemById(featureId, false, { isActive: false });
+            if (feature.isActive !== false) {
+                feature.eggTimer = (Math.floor(feature.eggTimer / 60) * 60) + msg.extractPayloadByte(i + 1);
+            }
         }
         msg.isProcessed = true;
     }
     private static processShowInFeatures(msg: Inbound) {
         for (let i = 1; i < msg.payload.length - 1 && i <= sys.equipment.maxFeatures; i++) {
             let featureId = i + sys.board.equipmentIds.features.start - 1;
-            var feature: Feature = sys.features.getItemById(featureId);
-            feature.showInFeatures = msg.extractPayloadByte(i + 1) > 0;
-            if (feature.isActive) state.features.getItemById(featureId, feature.isActive).showInFeatures = feature.showInFeatures;
+            var feature: Feature = sys.features.getItemById(featureId, false, { isActive: false });
+            if (feature.isActive !== false) {
+                feature.showInFeatures = msg.extractPayloadByte(i + 1) > 0;
+                state.features.getItemById(featureId, true).showInFeatures = feature.showInFeatures;
+            }
         }
         state.emitEquipmentChanges();
         msg.isProcessed = true;

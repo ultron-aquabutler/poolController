@@ -15,9 +15,112 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-import { Inbound } from "../Messages";
+import { Inbound, Message, Outbound, Response } from "../Messages";
 import { sys, ConfigVersion } from "../../../Equipment";
+import { logger } from "../../../../logger/Logger";
+
 export class VersionMessage {
+    // Debounce config refresh requests to avoid duplicate requests from overlapping triggers
+    private static lastConfigRefreshTime: number = 0;
+    private static readonly CONFIG_REFRESH_DEBOUNCE_MS = 2000;  // 2 seconds
+    private static pendingConfigRefreshTimer?: NodeJS.Timeout;
+    private static pendingConfigRefreshSource?: string;
+    private static scheduleConfigRefresh(delayMs: number, source: string, reason: string): void {
+        this.pendingConfigRefreshSource = source;
+        if (!this.pendingConfigRefreshTimer) {
+            this.pendingConfigRefreshTimer = setTimeout(() => {
+                this.pendingConfigRefreshTimer = undefined;
+                const src = this.pendingConfigRefreshSource || 'Trailing';
+                this.pendingConfigRefreshSource = undefined;
+                this.triggerConfigRefresh(src);
+            }, delayMs);
+        }
+        logger.silly(`v3.004+ ${source}: Deferring config refresh (${reason}, retry in ${delayMs}ms)`);
+    }
+
+    /**
+     * Shared method to trigger a config refresh with debouncing.
+     * Prevents duplicate requests when multiple triggers fire in quick succession.
+     */
+    private static triggerConfigRefresh(source: string): void {
+        const now = Date.now();
+        const elapsed = now - this.lastConfigRefreshTime;
+        if (elapsed < this.CONFIG_REFRESH_DEBOUNCE_MS) {
+            const remainingMs = Math.max(0, this.CONFIG_REFRESH_DEBOUNCE_MS - elapsed);
+            this.scheduleConfigRefresh(remainingMs, source, `debounced (last send ${elapsed}ms ago)`);
+            return;
+        }
+        if (typeof (sys.board as any).isConfigQueueProcessing === 'function' &&
+            (sys.board as any).isConfigQueueProcessing()) {
+            if (typeof (sys.board as any).signalConfigRefreshNeeded === 'function') {
+                (sys.board as any).signalConfigRefreshNeeded();
+            }
+            logger.silly(`v3.004+ ${source}: Config queue active, signaled refresh on completion`);
+            return;
+        }
+        this.lastConfigRefreshTime = now;
+
+        (sys.board as any).needsConfigChanges = true;
+        sys.configVersion.options = 0;
+        sys.configVersion.systemState = 0;
+
+        logger.silly(`v3.004+ ${source}: Sending Action 228`);
+        const commandSource = sys.board.commandSourceAddress || Message.pluginAddress;
+        Outbound.create({
+            source: commandSource,
+            dest: 16, action: 228, payload: [0], retries: 2,
+            response: Response.create({ dest: commandSource, action: 164 })
+        }).sendAsync().catch((err) => {
+            logger.silly(`v3.004+ ${source}: Action 228 refresh failed: ${err.message}`);
+        });
+    }
+
+    /**
+     * v3.004+ Piggyback: When another device sends Action 228 to OCP,
+     * send our own to catch config changes. See .plan/202-intellicenter-bodies-temps.md
+     */
+    public static processVersionRequest(msg: Inbound): void {
+        if (sys.equipment.isIntellicenterV3 &&
+            msg.source !== Message.pluginAddress &&  // Not from us
+            msg.dest === 16) {                        // Directed to OCP
+            // TEST: disable Action 228 piggyback refresh for v3.008 A/B validation.
+            // this.triggerConfigRefresh('Piggyback');
+        }
+        msg.isProcessed = true;
+    }
+
+    /**
+     * v3.004+ ACK Trigger (single entrypoint):
+     * When OCP ACKs a Wireless/other device's Action 168 or 184, trigger a debounced config refresh.
+     *
+     * Intended call-site: `Messages.ts` should gate on ACK payload[0] (168/184) and then call this method once.
+     */
+    public static processActionAck(msg: Inbound): void {
+        // Gate: only v3.004+
+        if (!sys.equipment.isIntellicenterV3) {
+            msg.isProcessed = true;
+            return;
+        }
+        // Gate: only when ACK originates from OCP (src=16) to some other device (not us, not OCP).
+        if (msg.source !== 16 || msg.dest === Message.pluginAddress || msg.dest === 16) {
+            msg.isProcessed = true;
+            return;
+        }
+        // Gate: only ACKing Action 168 or 184 (caller should gate, but keep defensive checks here too).
+        const ackedAction = msg.payload.length > 0 ? msg.payload[0] : undefined;
+        if (ackedAction !== 168 && ackedAction !== 184) {
+            msg.isProcessed = true;
+            return;
+        }
+
+        const label =
+            ackedAction === 168
+                ? `ACK(168) Trigger (device ${msg.dest})`
+                : `ACK(184) Trigger (device ${msg.dest})`;
+        this.scheduleConfigRefresh(this.CONFIG_REFRESH_DEBOUNCE_MS, label, 'ACK debounce');
+        msg.isProcessed = true;
+    }
+
     public static process(msg: Inbound): void {
         var ver: ConfigVersion = new ConfigVersion({});
         ver.options = msg.extractPayloadInt(6);

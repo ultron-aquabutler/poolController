@@ -1,5 +1,5 @@
 /*  nodejs-poolController.  An application to control pool equipment.
-Copyright (C) 2016, 2017, 2018, 2019, 2020, 2021, 2022.  
+Copyright (C) 2016, 2017, 2018, 2019, 2020, 2021, 2022.
 Russell Goldin, tagyoureit.  russ.goldin@gmail.com
 
 This program is free software: you can redistribute it and/or modify
@@ -152,9 +152,9 @@ export async function startPacketCapture(bResetLogs: boolean) {
         config.setSection('log', log);
         logger.startCaptureForReplay(bResetLogs);
         if (bResetLogs){
-            sys.resetSystem();
+            await sys.resetSystemAsync();
         }
-        
+
         // Start packet capture on the REM server
         await REMInterfaceServer.startPacketCaptureOnRemServer();
     }
@@ -166,14 +166,24 @@ export async function stopPacketCaptureAsync() {
     let log = config.getSection('log');
     log.app.captureForReplay = false;
     config.setSection('log', log);
-    
+
     // Stop packet capture on the REM server and collect its logs
     let remLogs = await REMInterfaceServer.stopPacketCaptureOnRemServer();
-    
+
     // Pass REM logs to the logger for inclusion in the backup
     return logger.stopCaptureForReplayAsync(remLogs);
 }
-export async function stopAsync(): Promise<void> {
+let _stopPromise: Promise<void> = null;
+export function stopAsync(): Promise<void> {
+    // Signals can arrive more than once (SIGINT + SIGTERM, repeated Ctrl+C); only run shutdown once.
+    if (_stopPromise) {
+        console.log('Shutdown already in progress');
+        return _stopPromise;
+    }
+    _stopPromise = stopProcessesAsync();
+    return _stopPromise;
+}
+async function stopProcessesAsync(): Promise<void> {
     try {
         console.log('Shutting down open processes');
         await webApp.stopAutoBackup();
@@ -202,9 +212,12 @@ if (process.platform === 'win32') {
 }
 else {
     process.stdin.resume();
-    process.on('SIGINT', async function () {
+    const onStopSignal = async function () {
         try { return await stopAsync(); } catch (err) { console.log(`Error shutting down processes ${err.message}`); }
-    });
+    };
+    process.on('SIGINT', onStopSignal);
+    // systemd, Docker, and pm2 stop the process with SIGTERM.
+    process.on('SIGTERM', onStopSignal);
 }
 if (typeof process === 'object') {
     process.on('unhandledRejection', (error: Error, promise) => {

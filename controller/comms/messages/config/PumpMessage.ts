@@ -21,6 +21,28 @@ import {state, CircuitState} from "../../../State";
 import {ControllerType} from "../../../Constants";
 import { logger } from "../../../../logger/Logger";
 export class PumpMessage {
+    private static normalizePumpBodyCode(rawBody: number): number {
+        const poolBody = sys.board.valueMaps.pumpBodies.getValue('pool');
+        const spaBody = sys.board.valueMaps.pumpBodies.getValue('spa');
+        const poolSpaBody = sys.board.valueMaps.pumpBodies.getValue('poolspa');
+        const sharedPool = sys.board.valueMaps.bodies.getValue('pool');
+        const sharedSpa = sys.board.valueMaps.bodies.getValue('spa');
+        const sharedPoolSpa = sys.board.valueMaps.bodies.getValue('poolspa');
+        if (rawBody === sharedPool) return poolBody;
+        if (rawBody === sharedSpa) return spaBody;
+        if (rawBody === sharedPoolSpa) return poolSpaBody;
+        return rawBody;
+    }
+    private static decodePumpBodyCode(rawBody: number): number | undefined {
+        const normalized = PumpMessage.normalizePumpBodyCode(rawBody);
+        return sys.board.valueMaps.pumpBodies.valExists(normalized) ? normalized : undefined;
+    }
+    private static normalizeIntelliCenterPumpAddress(rawAddress: number): number {
+        // IntelliCenter address picklists use the 96..111 wire range. If OCP reports low slot
+        // values (1..16), normalize them so API/UI consumers stay on the expected address scale.
+        if (rawAddress > 0 && rawAddress <= 16) return rawAddress + 95;
+        return rawAddress;
+    }
     public static process(msg: Inbound): void {
         switch (sys.controllerType) {
             case ControllerType.IntelliCenter:
@@ -111,24 +133,42 @@ export class PumpMessage {
         let pumpId: number;
         let pump: Pump;
         let msgId: number = msg.extractPayloadByte(1);
+        // IntelliCenter v3 uses big-endian 16-bit values for pump speeds/flows.
+        const useBigEndian = sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3;
+        const readInt = (ndx: number) => useBigEndian ? msg.extractPayloadIntBE(ndx) : msg.extractPayloadInt(ndx);
         // First process the pump types.  This will allow us to add or remove any installed pumps. All subsequent messages will not create pumps in the collection.
         if (msgId === 4) PumpMessage.processPumpType(msg);
-        if (msgId <= 15) {
+        const hasInlinePumpConfig = msg.payload.length > 34;
+        if (msgId <= 15 && hasInlinePumpConfig) {
             let circuitId = 1;
             pumpId = msgId + 1;
             pump = sys.pumps.getItemById(pumpId);
-            if (pump.type === 1) { // If this is a single speed pump it will have the body stored in the first circuit position.  All other pumps have no
-                // reference to the body.
-                pump.body = msg.extractPayloadByte(34);
+            const pumpType = sys.board.valueMaps.pumpTypes.transform(pump.type);
+            const hasBodyAssociation = pumpType.hasBody === true;
+            const isDualSpeed = pumpType.name === 'ds';
+            if (hasBodyAssociation) {
+                // Aggregate sub-messages (msgId 1..7) can carry stale/placeholder body bytes.
+                // Only trust inline body on true inline pages and keep msgId 2 as authoritative
+                // for body-capable pumps (handled in processMinFlow()).
+                const inlineBodyApplies = msgId === 0 || msgId >= 8;
+                if (inlineBodyApplies) {
+                    const decodedBody = PumpMessage.decodePumpBodyCode(msg.extractPayloadByte(34));
+                    if (typeof decodedBody !== 'undefined') pump.body = decodedBody;
+                }
+            }
+            if (pumpType.name === 'ss') {
                 // Clear the circuits as there should be none.
                 pump.circuits.clear();
             }
             else if (pump.type !== 0 && typeof pump.type !== 'undefined') {
-                for (let i = 34; i < msg.payload.length && circuitId <= sys.board.valueMaps.pumpTypes.get(pump.type).maxCircuits; i++) {
+                const circuitStartNdx = isDualSpeed && hasBodyAssociation ? 35 : 34;
+                const maxCircuits = isDualSpeed && hasBodyAssociation ? Math.max((pumpType.maxCircuits || 0) - 1, 0) : (pumpType.maxCircuits || 0);
+                for (let i = circuitStartNdx; i < msg.payload.length && circuitId <= maxCircuits; i++) {
                     let circuit = msg.extractPayloadByte(i);
                     if (circuit !== 255) pump.circuits.getItemById(circuitId++, true).circuit = circuit + 1;
                     else pump.circuits.removeItemById(circuitId++);
                 }
+                while (circuitId <= 8) pump.circuits.removeItemById(circuitId++);
             }
             // Speed/Flow
             if (pump.type > 2) {
@@ -136,14 +176,14 @@ export class PumpMessage {
                 circuitId = 1;
                 for (let i = 18; i < msg.payload.length && circuitId <= sys.board.valueMaps.pumpTypes.get(pump.type).maxCircuits;) {
                     let circuit: PumpCircuit = pump.circuits.getItemById(circuitId);
-                    let rate = msg.extractPayloadInt(i);
+                    let rate = readInt(i);
                     // If the rate is < 450 then this must be a flow based value.
                     if (rate < 450) {
                         circuit.flow = rate;
                         circuit.units = 1;
                         circuit.speed = undefined;
                     } else {
-                        circuit.speed = msg.extractPayloadInt(i);
+                        circuit.speed = rate;
                         circuit.units = 0;
                         circuit.flow = undefined;
                     }
@@ -218,7 +258,20 @@ export class PumpMessage {
     private static processMinFlow(msg: Inbound) {
         let pumpId = 1;
         for (let i = 2; i < msg.payload.length && pumpId <= sys.equipment.maxPumps; i++) {
-            sys.pumps.getItemById(pumpId++).minFlow = msg.extractPayloadByte(i);
+            const pump = sys.pumps.getItemById(pumpId++);
+            const value = msg.extractPayloadByte(i);
+            const ptype = sys.board.valueMaps.pumpTypes.transform(pump.type);
+            // IntelliCenter SS/DS pumps reuse msgId 2 per-pump byte for body association updates.
+            // OCP authoritative responses can carry body here even when inline msgId<=15 byte 34
+            // remains 255, so map body-capable types from this path.
+            if (ptype.hasBody === true) {
+                const decodedBody = PumpMessage.decodePumpBodyCode(value);
+                if (typeof decodedBody !== 'undefined') pump.body = decodedBody;
+                else pump.minFlow = value;
+            }
+            else {
+                pump.minFlow = value;
+            }
         }
     }
     private static processMaxFlow(msg: Inbound) {
@@ -254,7 +307,11 @@ export class PumpMessage {
     private static processAddress(msg: Inbound) {
         let pumpId = 1;
         for (let i = 2; i < msg.payload.length && pumpId <= sys.equipment.maxPumps; i++) {
-            sys.pumps.getItemById(pumpId++).address = msg.extractPayloadByte(i);
+            const rawAddress = msg.extractPayloadByte(i);
+            const normalizedAddress = sys.controllerType === ControllerType.IntelliCenter
+                ? PumpMessage.normalizeIntelliCenterPumpAddress(rawAddress)
+                : rawAddress;
+            sys.pumps.getItemById(pumpId++).address = normalizedAddress;
         }
     }
     private static processPrimingTime(msg: Inbound) {
@@ -271,22 +328,25 @@ export class PumpMessage {
     }
     private static processMinSpeed(msg: Inbound) {
         let pumpId = 1;
+        const useBigEndian = sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3;
         for (let i = 2; i < msg.payload.length && pumpId <= sys.equipment.maxPumps;) {
-            sys.pumps.getItemById(pumpId++).minSpeed = msg.extractPayloadInt(i);
+            sys.pumps.getItemById(pumpId++).minSpeed = useBigEndian ? msg.extractPayloadIntBE(i) : msg.extractPayloadInt(i);
             i += 2;
         }
     }
     private static processMaxSpeed(msg: Inbound) {
         let pumpId = 1;
+        const useBigEndian = sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3;
         for (let i = 2; i < msg.payload.length && pumpId <= sys.equipment.maxPumps;) {
-            sys.pumps.getItemById(pumpId++).maxSpeed = msg.extractPayloadInt(i);
+            sys.pumps.getItemById(pumpId++).maxSpeed = useBigEndian ? msg.extractPayloadIntBE(i) : msg.extractPayloadInt(i);
             i += 2;
         }
     }
     private static processPrimingSpeed(msg: Inbound) {
         let pumpId = 1;
+        const useBigEndian = sys.controllerType === ControllerType.IntelliCenter && sys.equipment.isIntellicenterV3;
         for (let i = 2; i < msg.payload.length && pumpId <= sys.equipment.maxPumps;) {
-            sys.pumps.getItemById(pumpId++).primingSpeed = msg.extractPayloadInt(i);
+            sys.pumps.getItemById(pumpId++).primingSpeed = useBigEndian ? msg.extractPayloadIntBE(i) : msg.extractPayloadInt(i);
             i += 2;
         }
     }

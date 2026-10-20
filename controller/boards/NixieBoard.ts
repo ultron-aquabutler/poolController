@@ -33,6 +33,9 @@ const addrsPentairPump = Object.freeze([96, 97, 98, 99, 100, 101, 102, 103, 104,
 const addrsRegalModbusPump = Object.freeze(
     Array.from({ length: ((0xF7 - 0x15) / 2) + 1 }, (_, i) => 0x15 + i * 2)  // Odd numbers fro 0x15 through 0xF7
   );
+const addrsNeptuneModbusPump = Object.freeze(
+    Array.from({ length: 247 }, (_, i) => i + 1) // Modbus slave IDs 1..247
+);
 
 
 export class NixieBoard extends SystemBoard {
@@ -91,6 +94,7 @@ export class NixieBoard extends SystemBoard {
             [7, { name: 'hwrly', desc: 'Hayward Relay VS', hasAddress: false, maxCircuits: 8, maxRelays: 4, maxSpeeds: 8, relays: [{ id: 1, name: 'Step #1' }, { id: 2, name: 'Step #2'}, { id: 3, name: 'Step #3' }, { id: 4, name: 'Pump On' }], addresses: [] }],
             [100, { name: 'sf', desc: 'SuperFlo VS', hasAddress: false, maxCircuits: 8, maxRelays: 4, equipmentMaster: 1, maxSpeeds: 4, relays: [{ id: 1, name: 'Program #1' }, { id: 2, name: 'Program #2' }, { id: 3, name: 'Program #3' }, { id: 4, name: 'Program #4' }], addresses: [] }],
             [200, { name: 'regalmodbus', desc: 'Regal Modbus', minSpeed: 450, maxSpeed: 3450, maxCircuits: 8, hasAddress: true, addresses: addrsRegalModbusPump}],
+            [201, { name: 'neptunemodbus', desc: 'Neptune Modbus', minSpeed: 450, maxSpeed: 3450, maxCircuits: 8, hasAddress: true, addresses: addrsNeptuneModbusPump }],
         ]);
         // RSG - same as systemBoard definition; can delete.
         this.valueMaps.heatModes = new byteValueMap([
@@ -134,7 +138,16 @@ export class NixieBoard extends SystemBoard {
             [7, { name: 'aquarite-t5', desc: 'AquaRite T5', capacity: 20000, chlorinePerDay: 0.735, chlorinePerSec: 0.735 / 86400 }],
             [8, { name: 'aquarite-t3', desc: 'AquaRite T3', capacity: 15000, chlorinePerDay: 0.53, chlorinePerSec: 0.53 / 86400 }],
             [9, { name: 'aquarite-925', desc: 'AquaRite 925', capacity: 25000, chlorinePerDay: 0.98, chlorinePerSec: 0.98 / 86400 }],
-            [10, { name: 'aquarite-940', desc: 'AquaRite 940', capacity: 40000, chlorinePerDay: 1.47, chlorinePerSec: 1.47 / 86400 }]
+            [10, { name: 'aquarite-940', desc: 'AquaRite 940', capacity: 40000, chlorinePerDay: 1.47, chlorinePerSec: 1.47 / 86400 }],
+            [11, { name: 'ichlor-ic15', desc: 'iChlor IC15', capacity: 15000, chlorinePerDay: 0.6, chlorinePerSec: 0.6 / 86400 }],
+            [12, { name: 'ichlor-ic30', desc: 'iChlor IC30', capacity: 30000, chlorinePerDay: 1.0, chlorinePerSec: 1.0 / 86400 }],
+            // IntelliChlor Plus & LT series (2025+).  Keep these in sync with SystemBoard.chlorinatorModel.
+            // See .plan/503-pentair-intellichlor-plus-lt.md.
+            [13, { name: 'intellichlor-lt15', desc: 'IntelliChlor LT15', capacity: 15000, chlorinePerDay: 0.65, chlorinePerSec: 0.65 / 86400 }],
+            [14, { name: 'intellichlor-lt25', desc: 'IntelliChlor LT25', capacity: 25000, chlorinePerDay: 0.90, chlorinePerSec: 0.90 / 86400 }],
+            [15, { name: 'intellichlor-plus30', desc: 'IntelliChlor Plus30', capacity: 30000, chlorinePerDay: 1.10, chlorinePerSec: 1.10 / 86400 }],
+            [16, { name: 'intellichlor-plus40', desc: 'IntelliChlor Plus40', capacity: 40000, chlorinePerDay: 1.40, chlorinePerSec: 1.40 / 86400 }],
+            [17, { name: 'intellichlor-plus60', desc: 'IntelliChlor Plus60', capacity: 60000, chlorinePerDay: 2.00, chlorinePerSec: 2.00 / 86400 }]
         ]);
 
 
@@ -249,7 +262,7 @@ export class NixieBoard extends SystemBoard {
             [64, { name: 'violet', desc: 'Violet', types: ['watercolors'], sequence: 9 }],
             [65, { name: 'slowcolorsplash', desc: 'Slow Color Splash', types: ['watercolors'], sequence: 10 }],
             [66, { name: 'fastcolorsplash', desc: 'Fast Color Splash', types: ['watercolors'], sequence: 11 }],
-            [67, { name: 'americathebeautiful', desc: 'America the Beautiful', types: ['watercolors'], sequence: 12 }],
+            [67, { name: 'americathebeautiful', desc: 'America Beautiful', types: ['watercolors'], sequence: 12 }],
             [68, { name: 'fattuesday', desc: 'Fat Tuesday', types: ['watercolors'], sequence: 13 }],
             [69, { name: 'discotech', desc: 'Disco Tech', types: ['watercolors'], sequence: 14 }],
             [255, { name: 'none', desc: 'None' }]
@@ -390,6 +403,7 @@ export class NixieBoard extends SystemBoard {
                 pool.capacityUnits = bodyUnits;
                 sbody.name = pool.name;
                 sbody.setPoint = pool.setPoint;
+                sbody.heatMode = pool.heatMode;
                 sbody.circuit = pool.circuit;
                 sbody.type = pool.type;
                 // We need to add in a circuit for 6.
@@ -421,6 +435,7 @@ export class NixieBoard extends SystemBoard {
                     sbody = state.temps.bodies.getItemById(2, true);
                     sbody.name = spa.name;
                     sbody.setPoint = spa.setPoint;
+                    sbody.heatMode = spa.heatMode;
                     sbody.circuit = spa.circuit;
                     sbody.type = spa.type;
                     spa.capacityUnits = bodyUnits;
@@ -628,6 +643,10 @@ export class NixieSystemCommands extends SystemCommands {
                 this._modeTimer = null;
                 state.mode = 0;
                 webApp.emitToClients('panelMode', { mode: mode, remaining: 0 });
+                if (utils.makeBool(data.resumeSchedules)) {
+                    await sys.board.schedules.syncScheduleStates();
+                    await sys.board.circuits.syncCircuitRelayStates();
+                }
                 break;
         }
     }
@@ -645,6 +664,9 @@ export class NixieSystemCommands extends SystemCommands {
         else {
             webApp.emitToClients('panelMode', { mode: sys.board.valueMaps.panelModes.transform(0), remaining: 0 });
             state.mode = 0;
+            // Resume schedules immediately when timeout expires naturally.
+            sys.board.schedules.syncScheduleStates();
+            sys.board.circuits.syncCircuitRelayStates();
         }
     }
     public async initServiceMode(mode, timeout?: number) {
@@ -1111,9 +1133,7 @@ export class NixieCircuitCommands extends CircuitCommands {
         return arr;
     }
     public getCircuitFunctions() {
-        let cf = sys.board.valueMaps.circuitFunctions.toArray();
-        if (!sys.equipment.shared) cf = cf.filter(x => { return x.name !== 'spillway' && x.name !== 'spadrain' });
-        return cf;
+        return super.getCircuitFunctions();
     }
     public getCircuitNames() {
         return [...sys.board.valueMaps.circuitNames.toArray(), ...sys.board.valueMaps.customNames.toArray()];
@@ -1133,6 +1153,7 @@ export class NixieCircuitCommands extends CircuitCommands {
             if (data.name) circuit.name = scircuit.name = data.name;
             else if (!circuit.name && !data.name) circuit.name = scircuit.name = Circuit.getIdName(id);
             if (typeof data.type !== 'undefined' || typeof circuit.type === 'undefined') circuit.type = scircuit.type = parseInt(data.type, 10) || 0;
+            this.assertSinglePoolSpaType(id, circuit.type);
             if (typeof data.freeze !== 'undefined' || typeof circuit.freeze === 'undefined') circuit.freeze = utils.makeBool(data.freeze) || false;
             if (typeof data.showInFeatures !== 'undefined' || typeof data.showInFeatures === 'undefined') circuit.showInFeatures = scircuit.showInFeatures = utils.makeBool(data.showInFeatures);
             if (typeof data.dontStop !== 'undefined' && utils.makeBool(data.dontStop) === true) data.eggTimer = 1440;
@@ -1782,7 +1803,8 @@ export class NixieValveCommands extends ValveCommands {
     public async setValveStateAsync(valve: Valve, vstate: ValveState, isDiverted: boolean) {
         try {
             vstate.name = valve.name;
-            await ncp.valves.setValveStateAsync(vstate, isDiverted);
+            if (valve.master === 1) await ncp.valves.setValveStateAsync(vstate, isDiverted);
+            else vstate.isDiverted = isDiverted;
         } catch (err) { logger.error(`Nixie: Error setting valve ${vstate.id}-${vstate.name} state to ${isDiverted}: ${err}`); return Promise.reject(err); }
     }
 }
@@ -1836,6 +1858,7 @@ export class NixieHeaterCommands extends HeaterCommands {
         let gasHeaterInstalled = htypes.gas > 0;
         let ultratempInstalled = htypes.ultratemp > 0;
         let mastertempInstalled = htypes.mastertemp > 0;
+        let jxiInstalled = (htypes.jxi || 0) > 0 || (htypes.lxi || 0) > 0;
         let hybridInstalled = htypes.hybrid > 0;
         // The heat mode options are
         // 1 = Off
@@ -1887,7 +1910,7 @@ export class NixieHeaterCommands extends HeaterCommands {
             //    [21, { name: 'dual', desc: 'Dual Heat' }]
             //]);
         }
-        if (gasHeaterInstalled) sys.board.valueMaps.heatSources.merge([[2, { name: 'heater', desc: 'Heater' }]]);
+        if (gasHeaterInstalled || jxiInstalled) sys.board.valueMaps.heatSources.merge([[2, { name: 'heater', desc: 'Heater' }]]);
         if (mastertempInstalled) sys.board.valueMaps.heatSources.merge([[11, { name: 'mtheater', desc: 'MasterTemp' }]]);
         if (solarInstalled && (gasHeaterInstalled || heatPumpInstalled)) sys.board.valueMaps.heatSources.merge([[3, { name: 'solar', desc: 'Solar Only', hasCoolSetpoint: htypes.hasCoolSetpoint }], [4, { name: 'solarpref', desc: 'Solar Preferred', hasCoolSetpoint: htypes.hasCoolSetpoint }]]);
         else if (solarInstalled) sys.board.valueMaps.heatSources.merge([[3, { name: 'solar', desc: 'Solar', hasCoolSetpoint: htypes.hasCoolSetpoint }]]);
@@ -1898,12 +1921,12 @@ export class NixieHeaterCommands extends HeaterCommands {
         sys.board.valueMaps.heatSources.merge([[0, { name: 'nochange', desc: 'No Change' }]]);
 
 
-        if (gasHeaterInstalled) sys.board.valueMaps.heatModes.merge([[2, { name: 'heater', desc: 'Heater' }]]);
+        if (gasHeaterInstalled || jxiInstalled) sys.board.valueMaps.heatModes.merge([[2, { name: 'heater', desc: 'Heater' }]]);
         if (mastertempInstalled) sys.board.valueMaps.heatModes.merge([[11, { name: 'mtheater', desc: 'MasterTemp' }]]);
-        if (solarInstalled && (gasHeaterInstalled || heatPumpInstalled || mastertempInstalled)) sys.board.valueMaps.heatModes.merge([[3, { name: 'solar', desc: 'Solar Only' }], [4, { name: 'solarpref', desc: 'Solar Preferred' }]]);
-        else if (solarInstalled) sys.board.valueMaps.heatModes.merge([[3, { name: 'solar', desc: 'Solar' }]]);
-        if (ultratempInstalled && (gasHeaterInstalled || heatPumpInstalled || mastertempInstalled)) sys.board.valueMaps.heatModes.merge([[5, { name: 'ultratemp', desc: 'UltraTemp Only' }], [6, { name: 'ultratemppref', desc: 'UltraTemp Pref' }]]);
-        else if (ultratempInstalled) sys.board.valueMaps.heatModes.merge([[5, { name: 'ultratemp', desc: 'UltraTemp' }]]);
+        if (solarInstalled && (gasHeaterInstalled || heatPumpInstalled || mastertempInstalled)) sys.board.valueMaps.heatModes.merge([[3, { name: 'solar', desc: 'Solar Only', hasCoolSetpoint: htypes.hasCoolSetpoint }], [4, { name: 'solarpref', desc: 'Solar Preferred', hasCoolSetpoint: htypes.hasCoolSetpoint }]]);
+        else if (solarInstalled) sys.board.valueMaps.heatModes.merge([[3, { name: 'solar', desc: 'Solar', hasCoolSetpoint: htypes.hasCoolSetpoint }]]);
+        if (ultratempInstalled && (gasHeaterInstalled || heatPumpInstalled || mastertempInstalled)) sys.board.valueMaps.heatModes.merge([[5, { name: 'ultratemp', desc: 'UltraTemp Only', hasCoolSetpoint: htypes.hasCoolSetpoint }], [6, { name: 'ultratemppref', desc: 'UltraTemp Pref', hasCoolSetpoint: htypes.hasCoolSetpoint }]]);
+        else if (ultratempInstalled) sys.board.valueMaps.heatModes.merge([[5, { name: 'ultratemp', desc: 'UltraTemp', hasCoolSetpoint: htypes.hasCoolSetpoint }]]);
         if (heatPumpInstalled && (gasHeaterInstalled || solarInstalled || mastertempInstalled)) sys.board.valueMaps.heatModes.merge([[9, { name: 'heatpump', desc: 'Heatpump Only' }], [25, { name: 'heatpumppref', desc: 'Heat Pump Preferred' }]]);
         else if (heatPumpInstalled) sys.board.valueMaps.heatModes.merge([[9, { name: 'heatpump', desc: 'Heat Pump' }]]);
         // Now set the body data.

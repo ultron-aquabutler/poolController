@@ -70,7 +70,7 @@ export class ConfigSocket {
         app.get('/config/options/circuits', (req, res) => {
             let opts = {
                 maxCircuits: sys.equipment.maxCircuits,
-                equipmentIds: sys.equipment.equipmentIds.circuits,
+                equipmentIds: (sys.equipment.equipmentIds || sys.board.equipmentIds).circuits,
                 invalidIds: sys.board.equipmentIds.invalidIds.get(),
                 equipmentNames: sys.board.circuits.getCircuitNames(),
                 functions: sys.board.circuits.getCircuitFunctions(),
@@ -103,7 +103,7 @@ export class ConfigSocket {
             let opts = {
                 maxFeatures: sys.equipment.maxFeatures,
                 invalidIds: sys.board.equipmentIds.invalidIds.get(),
-                equipmentIds: sys.equipment.equipmentIds.features,
+                equipmentIds: (sys.equipment.equipmentIds || sys.board.equipmentIds).features,
                 equipmentNames: sys.board.circuits.getCircuitNames(),
                 functions: sys.board.valueMaps.featureFunctions.toArray(),
                 features: sys.features.get()
@@ -153,6 +153,7 @@ export class ConfigSocket {
             return res.status(200).send(opts);
         });
         app.get('/config/options/schedules', (req, res) => {
+            sys.board.heaters.updateHeaterServices();
             let opts = {
                 maxSchedules: sys.equipment.maxSchedules,
                 tempUnits: sys.board.valueMaps.tempUnits.transform(state.temps.units),
@@ -162,8 +163,14 @@ export class ConfigSocket {
                 heatSources: sys.board.valueMaps.heatSources.toArray(),
                 circuits: sys.board.circuits.getCircuitReferences(true, true, false, true),
                 schedules: sys.schedules.get(),
-                clockMode: sys.general.options.clockMode || 12
+                clockMode: sys.general.options.clockMode || 12,
+                displayTypes: sys.board.valueMaps.scheduleDisplayTypes.toArray(),
+                bodies: []
             };
+            for (let i = 0; i < sys.bodies.length; i++) {
+                let body = sys.bodies.getItemByIndex(i);
+                (opts.bodies as any[]).push({ id: body.id, circuit: body.circuit, name: body.name, alias: body.alias, heatSources: sys.board.bodies.getHeatSources(body.id) });
+            }
             return res.status(200).send(opts);
         });
         app.get('/config/options/heaters', (req, res) => {
